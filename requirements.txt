@@ -39,3 +39,4 @@ xlrd==2.0.2
 pydantic==2.9.2
 chardet==5.2.0
 tenacity>=9.0.0
+poma>=0.3.4
