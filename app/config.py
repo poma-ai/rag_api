@@ -70,6 +70,25 @@ MONGO_VECTOR_COLLECTION = get_env_variable(
 CHUNK_SIZE = int(get_env_variable("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(get_env_variable("CHUNK_OVERLAP", "100"))
 
+# Chunking / context-assembly strategy
+#
+# Default behavior (CHUNKER_PROVIDER=langchain) preserves the current stack:
+#   loader -> RecursiveCharacterTextSplitter -> vector store
+#
+# Set CHUNKER_PROVIDER=poma to use POMA structural chunking (chunksets).
+# In that mode you can optionally return POMA cheatsheets (assembled context)
+# instead of raw retrieved chunksets.
+CHUNKER_PROVIDER = get_env_variable("CHUNKER_PROVIDER", "langchain").lower()
+POMA_RETURN_CHEATSHEETS = (
+    get_env_variable("POMA_RETURN_CHEATSHEETS", "False").lower() == "true"
+)
+POMA_STORE_DIR = get_env_variable("POMA_STORE_DIR", os.path.join(RAG_UPLOAD_DIR, "_poma"))
+os.makedirs(POMA_STORE_DIR, exist_ok=True)
+
+# POMA chunking job polling
+POMA_TIMEOUT_SECONDS = int(get_env_variable("POMA_TIMEOUT_SECONDS", "900"))
+POMA_POLL_INTERVAL_SECONDS = float(get_env_variable("POMA_POLL_INTERVAL_SECONDS", "2"))
+
 # Batch processing configuration for memory-constrained environments.
 # When EMBEDDING_BATCH_SIZE > 0, documents are processed in batches to reduce
 # peak memory usage. This is useful for Kubernetes pods with memory limits.

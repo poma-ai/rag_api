@@ -36,6 +36,8 @@ from app.config import (
     CHUNK_OVERLAP,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_MAX_QUEUE_SIZE,
+    CHUNKER_PROVIDER,
+    POMA_RETURN_CHEATSHEETS,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -52,6 +54,14 @@ from app.utils.document_loader import (
     cleanup_temp_encoding_file,
 )
 from app.utils.health import is_health_ok
+
+from app.services.poma_bridge import (
+    poma_chunk_file,
+    poma_store_chunking_result,
+    poma_delete_chunking_result,
+    poma_chunksets_to_documents,
+    poma_build_cheatsheet_documents,
+)
 
 router = APIRouter()
 
@@ -252,6 +262,10 @@ async def delete_documents(request: Request, document_ids: List[str] = Body(...)
         if not all(id in existing_ids for id in document_ids):
             raise HTTPException(status_code=404, detail="One or more IDs not found")
 
+        if CHUNKER_PROVIDER == "poma":
+            for fid in document_ids:
+                poma_delete_chunking_result(fid)
+
         file_count = len(document_ids)
         return {
             "message": f"Documents for {file_count} file{'s' if file_count > 1 else ''} deleted successfully"
@@ -336,6 +350,11 @@ async def query_embeddings_by_file_id(
                 logger.warning(
                     f"Unauthorized access attempt by user {user_authorized} to a document with user_id {doc_user_id}"
                 )
+
+        if CHUNKER_PROVIDER == "poma" and POMA_RETURN_CHEATSHEETS and authorized_documents:
+            return poma_build_cheatsheet_documents(
+                query=body.query, retrieved=authorized_documents, k=body.k
+            )
 
         return authorized_documents
 
@@ -649,17 +668,60 @@ async def store_data_in_vector_db(
     user_id: str = "",
     clean_content: bool = False,
     executor=None,
+    source_file_path: str | None = None,
+    source_filename: str | None = None,
 ) -> bool:
-    # Run document preparation in executor to avoid blocking the event loop
     loop = asyncio.get_running_loop()
-    docs = await loop.run_in_executor(
-        executor,
-        _prepare_documents_sync,
-        data,
-        file_id,
-        user_id,
-        clean_content,
-    )
+
+    if CHUNKER_PROVIDER == "poma":
+        if not source_file_path:
+            raise HTTPException(
+                status_code=400,
+                detail="CHUNKER_PROVIDER=poma requires source_file_path",
+            )
+
+        # Run the (blocking) POMA chunking call in the executor.
+        chunking_result = await loop.run_in_executor(
+            executor,
+            poma_chunk_file,
+            source_file_path,
+        )
+
+        # Cache chunks+chunksets locally for later cheatsheet assembly.
+        try:
+            await loop.run_in_executor(
+                executor,
+                lambda: poma_store_chunking_result(
+                    file_id=file_id,
+                    filename=source_filename,
+                    user_id=user_id,
+                    result=chunking_result,
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to cache POMA chunking result for file_id=%s | Traceback: %s",
+                file_id,
+                traceback.format_exc(),
+            )
+
+        # Convert chunksets into documents to embed + store.
+        docs = await loop.run_in_executor(
+            executor,
+            lambda: poma_chunksets_to_documents(
+                file_id=file_id, user_id=user_id, chunking_result=chunking_result
+            ),
+        )
+    else:
+        # Run document preparation in executor to avoid blocking the event loop
+        docs = await loop.run_in_executor(
+            executor,
+            _prepare_documents_sync,
+            data,
+            file_id,
+            user_id,
+            clean_content,
+        )
 
     try:
         if EMBEDDING_BATCH_SIZE <= 0:
@@ -718,10 +780,13 @@ async def embed_local_file(
         loader, known_type, file_ext = get_loader(
             document.filename, document.file_content_type, document.filepath
         )
-        data = await run_in_executor(request.app.state.thread_pool, loader.load)
 
-        # Clean up temporary UTF-8 file if it was created for encoding conversion
-        cleanup_temp_encoding_file(loader)
+        if CHUNKER_PROVIDER == "poma":
+            data = []
+        else:
+            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            # Clean up temporary UTF-8 file if it was created for encoding conversion
+            cleanup_temp_encoding_file(loader)
 
         result = await store_data_in_vector_db(
             data,
@@ -729,6 +794,8 @@ async def embed_local_file(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            source_file_path=document.filepath,
+            source_filename=document.filename,
         )
 
         if result:
@@ -783,12 +850,16 @@ async def embed_file(
     await save_upload_file_async(file, temp_file_path)
 
     try:
-        data, known_type, file_ext = await load_file_content(
-            file.filename,
-            file.content_type,
-            temp_file_path,
-            request.app.state.thread_pool,
+        # Determine file type without necessarily loading/extracting content.
+        loader, known_type, file_ext = get_loader(
+            file.filename, file.content_type, temp_file_path
         )
+
+        if CHUNKER_PROVIDER == "poma":
+            data = []
+        else:
+            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            cleanup_temp_encoding_file(loader)
 
         result = await store_data_in_vector_db(
             data=data,
@@ -796,6 +867,8 @@ async def embed_file(
             user_id=user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            source_file_path=temp_file_path,
+            source_filename=file.filename,
         )
 
         if not result:
@@ -909,12 +982,15 @@ async def embed_file_upload(
     await save_upload_file_async(uploaded_file, temp_file_path)
 
     try:
-        data, known_type, file_ext = await load_file_content(
-            uploaded_file.filename,
-            uploaded_file.content_type,
-            temp_file_path,
-            request.app.state.thread_pool,
+        loader, known_type, file_ext = get_loader(
+            uploaded_file.filename, uploaded_file.content_type, temp_file_path
         )
+
+        if CHUNKER_PROVIDER == "poma":
+            data = []
+        else:
+            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            cleanup_temp_encoding_file(loader)
 
         result = await store_data_in_vector_db(
             data,
@@ -922,6 +998,8 @@ async def embed_file_upload(
             user_id,
             clean_content=file_ext == "pdf",
             executor=request.app.state.thread_pool,
+            source_file_path=temp_file_path,
+            source_filename=uploaded_file.filename,
         )
 
         if not result:
@@ -982,6 +1060,11 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
         if not documents:
             raise HTTPException(
                 status_code=404, detail="No documents found for the given query"
+            )
+
+        if CHUNKER_PROVIDER == "poma" and POMA_RETURN_CHEATSHEETS:
+            return poma_build_cheatsheet_documents(
+                query=body.query, retrieved=documents, k=body.k
             )
 
         return documents
