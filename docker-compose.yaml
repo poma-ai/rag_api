@@ -2,9 +2,9 @@ services:
   db:
     image: ankane/pgvector:latest
     environment:
-      POSTGRES_DB: mydatabase
-      POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: ${POSTGRES_DB:-mydatabase}
+      POSTGRES_USER: ${POSTGRES_USER:-myuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mypassword}
     volumes:
       - pgdata2:/var/lib/postgresql/data
     ports:
@@ -13,8 +13,8 @@ services:
   fastapi:
     build: .
     environment:
-      - DB_HOST=db
-      - DB_PORT=5432
+      - DB_HOST=${DB_HOST:-db}
+      - DB_PORT=${DB_PORT:-5432}
     ports:
       - "8000:8000"
     volumes:

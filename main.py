@@ -17,6 +17,7 @@ from app.config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     PDF_EXTRACT_IMAGES,
+    QUERY_GLOBAL,
     VECTOR_DB_TYPE,
     LogMiddleware,
     logger,
@@ -39,6 +40,10 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"Initialized thread pool with {max_workers} workers (CPU cores: {os.cpu_count()})"
     )
+    if QUERY_GLOBAL:
+        logger.warning(
+            "QUERY_GLOBAL=true enables full global retrieval for /query_global (no user_id filter)."
+        )
 
     if VECTOR_DB_TYPE == VectorDBType.PGVECTOR:
         await PSQLDatabase.get_pool()  # Initialize the pool

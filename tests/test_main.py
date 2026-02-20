@@ -78,12 +78,29 @@ def override_vector_store(monkeypatch):
     vector_store.embedding_function = DummyEmbedding()
 
     # Override similarity search to return a tuple (Document, score).
-    def dummy_similarity_search_with_score_by_vector(self, embedding, k, filter):
+    def dummy_similarity_search_with_score_by_vector(self, embedding, k, filter=None):
+        file_id = "testid1"
+        user_id = "testuser"
+        if isinstance(filter, dict):
+            filter_file_id = filter.get("file_id")
+            if isinstance(filter_file_id, str):
+                file_id = filter_file_id
+            elif (
+                isinstance(filter_file_id, dict)
+                and isinstance(filter_file_id.get("$in"), list)
+                and filter_file_id["$in"]
+            ):
+                file_id = filter_file_id["$in"][0]
+
+            filter_user_id = filter.get("user_id")
+            if isinstance(filter_user_id, str):
+                user_id = filter_user_id
+
         doc = Document(
             page_content="Queried content",
             metadata={
-                "file_id": filter.get("file_id", "testid1"),
-                "user_id": "testuser",
+                "file_id": file_id,
+                "user_id": user_id,
             },
         )
         return [(doc, 0.9)]
@@ -91,11 +108,28 @@ def override_vector_store(monkeypatch):
     async def dummy_asimilarity_search_with_score_by_vector(
         self, embedding, k, filter=None, executor=None
     ):
+        file_id = "testid1"
+        user_id = "testuser"
+        if isinstance(filter, dict):
+            filter_file_id = filter.get("file_id")
+            if isinstance(filter_file_id, str):
+                file_id = filter_file_id
+            elif (
+                isinstance(filter_file_id, dict)
+                and isinstance(filter_file_id.get("$in"), list)
+                and filter_file_id["$in"]
+            ):
+                file_id = filter_file_id["$in"][0]
+
+            filter_user_id = filter.get("user_id")
+            if isinstance(filter_user_id, str):
+                user_id = filter_user_id
+
         doc = Document(
             page_content="Queried content",
             metadata={
-                "file_id": filter.get("file_id", "testid1") if filter else "testid1",
-                "user_id": "testuser",
+                "file_id": file_id,
+                "user_id": user_id,
             },
         )
         return [(doc, 0.9)]
@@ -245,6 +279,153 @@ def test_query_multiple(auth_headers):
     if json_data:
         doc = json_data[0][0]
         assert doc["page_content"] == "Queried content"
+
+
+def test_query_global_user_scoped(auth_headers, monkeypatch):
+    from app.routes import document_routes
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    captured = {}
+
+    async def dummy_asimilarity_search_with_score_by_vector(
+        self, embedding, k, filter=None, executor=None
+    ):
+        captured["filter"] = filter
+        return [
+            (
+                Document(
+                    page_content="Global queried content",
+                    metadata={"file_id": "global_testid", "user_id": "testuser"},
+                ),
+                0.9,
+            )
+        ]
+
+    monkeypatch.setattr(document_routes, "QUERY_GLOBAL", False)
+    monkeypatch.setattr(
+        AsyncPgVector,
+        "asimilarity_search_with_score_by_vector",
+        dummy_asimilarity_search_with_score_by_vector,
+    )
+
+    response = client.post(
+        "/query_global",
+        json={"query": "Global query", "k": 4},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, f"Response: {response.text}"
+    assert captured["filter"] == {"user_id": "testuser"}
+
+    json_data = response.json()
+    assert isinstance(json_data, list)
+    assert json_data[0][0]["page_content"] == "Global queried content"
+    assert json_data[0][0]["metadata"]["user_id"] == "testuser"
+
+
+def test_query_global_user_scoped_public_fallback(monkeypatch):
+    from app.routes import document_routes
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    captured = {}
+
+    async def dummy_asimilarity_search_with_score_by_vector(
+        self, embedding, k, filter=None, executor=None
+    ):
+        captured["filter"] = filter
+        return [
+            (
+                Document(
+                    page_content="Public global queried content",
+                    metadata={"file_id": "global_public", "user_id": "public"},
+                ),
+                0.9,
+            )
+        ]
+
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setattr(document_routes, "QUERY_GLOBAL", False)
+    monkeypatch.setattr(
+        AsyncPgVector,
+        "asimilarity_search_with_score_by_vector",
+        dummy_asimilarity_search_with_score_by_vector,
+    )
+
+    response = client.post("/query_global", json={"query": "Global query public", "k": 4})
+    assert response.status_code == 200, f"Response: {response.text}"
+    assert captured["filter"] == {"user_id": "public"}
+
+    json_data = response.json()
+    assert isinstance(json_data, list)
+    assert json_data[0][0]["metadata"]["user_id"] == "public"
+
+
+def test_query_global_full_global(auth_headers, monkeypatch):
+    from app.routes import document_routes
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    captured = {}
+
+    async def dummy_asimilarity_search_with_score_by_vector(
+        self, embedding, k, filter=None, executor=None
+    ):
+        captured["filter"] = filter
+        return [
+            (
+                Document(
+                    page_content="Full global queried content",
+                    metadata={"file_id": "global_any", "user_id": "otheruser"},
+                ),
+                0.9,
+            )
+        ]
+
+    monkeypatch.setattr(document_routes, "QUERY_GLOBAL", True)
+    monkeypatch.setattr(
+        AsyncPgVector,
+        "asimilarity_search_with_score_by_vector",
+        dummy_asimilarity_search_with_score_by_vector,
+    )
+
+    response = client.post(
+        "/query_global",
+        json={"query": "Global query full", "k": 4},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, f"Response: {response.text}"
+    assert captured["filter"] is None
+
+    json_data = response.json()
+    assert isinstance(json_data, list)
+    assert json_data[0][0]["metadata"]["user_id"] == "otheruser"
+
+
+def test_query_global_empty_results(auth_headers, monkeypatch):
+    from app.routes import document_routes
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    captured = {}
+
+    async def dummy_asimilarity_search_with_score_by_vector(
+        self, embedding, k, filter=None, executor=None
+    ):
+        captured["filter"] = filter
+        return []
+
+    monkeypatch.setattr(document_routes, "QUERY_GLOBAL", False)
+    monkeypatch.setattr(
+        AsyncPgVector,
+        "asimilarity_search_with_score_by_vector",
+        dummy_asimilarity_search_with_score_by_vector,
+    )
+
+    response = client.post(
+        "/query_global",
+        json={"query": "Global query no results", "k": 4},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, f"Response: {response.text}"
+    assert response.json() == []
+    assert captured["filter"] == {"user_id": "testuser"}
 
 
 def test_extract_text_from_file(tmp_path, auth_headers):

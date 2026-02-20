@@ -40,6 +40,13 @@ async def ensure_vector_indexes():
         """
         )
 
+        await conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{table_name}_user_id 
+            ON {table_name} ((cmetadata->>'user_id'));
+        """
+        )
+
         logger.info("Vector database indexes ensured")
 
 

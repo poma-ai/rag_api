@@ -82,6 +82,9 @@ The following environment variables are required to run the application:
 - `JWT_SECRET`: (Optional) The secret key used for verifying JWT tokens for requests.
   - The secret is only used for verification. This basic approach assumes a signed JWT from elsewhere.
   - Omit to run API without requiring authentication
+- `QUERY_GLOBAL`: (Optional) Controls behavior of `/query_global`. Default is `False`.
+  - `False`: global retrieval scoped to the current `user_id`.
+  - `True`: full global retrieval across all users/documents (security-sensitive).
 
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
@@ -123,6 +126,16 @@ The following environment variables are required to run the application:
 - `RAG_CHECK_EMBEDDING_CTX_LENGTH` (Optional) Default is true, disabling this will send raw input to the embedder, use this for custom embedding models.
 
 Make sure to set these environment variables before running the application. You can set them in a `.env` file or as system environment variables.
+
+### Query Endpoints and Scope
+
+- `POST /query`: Semantic search scoped to one `file_id`.
+- `POST /query_multiple`: Semantic search scoped to a provided list of `file_id` values.
+- `POST /query_global`: Global semantic search.
+  - When `QUERY_GLOBAL=False` (default), the query is filtered by current `user_id`.
+  - When `QUERY_GLOBAL=True`, the query is unfiltered (full global search across users).
+
+Use `QUERY_GLOBAL=True` only in trusted environments where cross-user retrieval is intentional.
 
 ### Embedding Batch Processing
 

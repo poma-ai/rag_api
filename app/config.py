@@ -82,6 +82,12 @@ CHUNKER_PROVIDER = get_env_variable("CHUNKER_PROVIDER", "langchain").lower()
 POMA_RETURN_CHEATSHEETS = (
     get_env_variable("POMA_RETURN_CHEATSHEETS", "False").lower() == "true"
 )
+QUERY_GLOBAL = get_env_variable("QUERY_GLOBAL", "False").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
+)
 POMA_STORE_DIR = get_env_variable("POMA_STORE_DIR", os.path.join(RAG_UPLOAD_DIR, "_poma"))
 os.makedirs(POMA_STORE_DIR, exist_ok=True)
 

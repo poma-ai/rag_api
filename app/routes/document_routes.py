@@ -38,6 +38,7 @@ from app.config import (
     EMBEDDING_MAX_QUEUE_SIZE,
     CHUNKER_PROVIDER,
     POMA_RETURN_CHEATSHEETS,
+    QUERY_GLOBAL,
 )
 from app.constants import ERROR_MESSAGES
 from app.models import (
@@ -45,6 +46,7 @@ from app.models import (
     QueryRequestBody,
     DocumentResponse,
     QueryMultipleBody,
+    QueryGlobalBody,
 )
 from app.services.vector_store.async_pg_vector import AsyncPgVector
 from app.utils.document_loader import (
@@ -369,6 +371,53 @@ async def query_embeddings_by_file_id(
         logger.error(
             "Error in query embeddings | File ID: %s | Query: %s | Error: %s | Traceback: %s",
             body.file_id,
+            body.query,
+            str(e),
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/query_global")
+async def query_embeddings_global(request: Request, body: QueryGlobalBody):
+    try:
+        embedding = get_cached_query_embedding(body.query)
+
+        query_filter = None
+        if not QUERY_GLOBAL:
+            query_filter = {"user_id": get_user_id(request, body.entity_id)}
+
+        if isinstance(vector_store, AsyncPgVector):
+            documents = await vector_store.asimilarity_search_with_score_by_vector(
+                embedding,
+                k=body.k,
+                filter=query_filter,
+                executor=request.app.state.thread_pool,
+            )
+        else:
+            documents = vector_store.similarity_search_with_score_by_vector(
+                embedding, k=body.k, filter=query_filter
+            )
+
+        if not documents:
+            return []
+
+        if CHUNKER_PROVIDER == "poma" and POMA_RETURN_CHEATSHEETS:
+            return poma_build_cheatsheet_documents(
+                query=body.query, retrieved=documents, k=body.k
+            )
+
+        return documents
+    except HTTPException as http_exc:
+        logger.error(
+            "HTTP Exception in query_embeddings_global | Status: %d | Detail: %s",
+            http_exc.status_code,
+            http_exc.detail,
+        )
+        raise http_exc
+    except Exception as e:
+        logger.error(
+            "Error in global query embeddings | Query: %s | Error: %s | Traceback: %s",
             body.query,
             str(e),
             traceback.format_exc(),
