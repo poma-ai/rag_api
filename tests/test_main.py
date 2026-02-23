@@ -237,8 +237,79 @@ def test_embed_file(tmp_path, auth_headers):
         )
     assert response.status_code == 200, f"Response: {response.text}"
     json_data = response.json()
+    assert set(json_data.keys()) == {
+        "status",
+        "message",
+        "file_id",
+        "filename",
+        "known_type",
+    }
     assert json_data["status"] is True
+    assert json_data["message"] == "File processed successfully."
     assert json_data["file_id"] == "testid1"
+    assert json_data["filename"] == "test_embed.txt"
+
+
+def test_embed_file_too_many_jobs_returns_structured_403(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+    from app.services.poma_bridge import PomaTooManyJobsError
+
+    file_content = "This should trigger a mocked POMA concurrency error."
+    test_file = tmp_path / "too_many_jobs.txt"
+    test_file.write_text(file_content)
+
+    def raise_too_many_jobs(_file_path):
+        raise PomaTooManyJobsError("Too many jobs", upstream_status=403)
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
+    monkeypatch.setattr(document_routes, "poma_chunk_file", raise_too_many_jobs)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("too_many_jobs.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 403, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "TOO_MANY_JOBS"
+    assert json_data["detail"] == "Too many jobs"
+    assert json_data["message"] == "Too many jobs"
+    assert json_data["upstream_status"] == 403
+
+
+def test_embed_file_unrelated_poma_error_not_misclassified(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    file_content = "This should trigger a generic mocked POMA error."
+    test_file = tmp_path / "other_poma_error.txt"
+    test_file.write_text(file_content)
+
+    def raise_other_error(_file_path):
+        raise RuntimeError("POMA exploded for another reason")
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
+    monkeypatch.setattr(document_routes, "poma_chunk_file", raise_other_error)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("other_poma_error.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 400, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data.get("code") is None
+    assert "TOO_MANY_JOBS" not in response.text
+    assert "Error during file processing" in json_data["detail"]
 
 
 def test_load_document_context(auth_headers):

@@ -14,6 +14,83 @@ from app.config import (
 )
 
 
+class PomaTooManyJobsError(RuntimeError):
+    def __init__(
+        self,
+        message: str = "Too many jobs",
+        *,
+        upstream_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_error_message(obj: Any) -> str:
+    if isinstance(obj, dict):
+        for key in ("detail", "message", "error", "errors"):
+            value = obj.get(key)
+            if isinstance(value, str) and value:
+                return value
+            if isinstance(value, list) and value:
+                return "; ".join(str(v) for v in value)
+    return str(obj)
+
+
+def _extract_upstream_status_from_error(err: Exception) -> int | None:
+    for attr in ("status_code", "status", "http_status"):
+        status = _safe_int(getattr(err, attr, None))
+        if status is not None:
+            return status
+
+    response = getattr(err, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            status = _safe_int(getattr(response, attr, None))
+            if status is not None:
+                return status
+
+    return None
+
+
+def _is_too_many_jobs_message(message: str) -> bool:
+    lowered = message.lower()
+    return "too many jobs" in lowered
+
+
+def _raise_if_poma_too_many_jobs_error(err: Exception) -> None:
+    if _is_too_many_jobs_message(str(err)):
+        raise PomaTooManyJobsError(
+            "Too many jobs",
+            upstream_status=_extract_upstream_status_from_error(err),
+        ) from err
+
+
+def _raise_if_poma_too_many_jobs_response(resp: Any) -> None:
+    if not isinstance(resp, dict):
+        return
+
+    message = _extract_error_message(resp)
+    if not _is_too_many_jobs_message(message):
+        return
+
+    upstream_status = None
+    for key in ("status_code", "status", "code"):
+        upstream_status = _safe_int(resp.get(key))
+        if upstream_status is not None:
+            break
+
+    raise PomaTooManyJobsError("Too many jobs", upstream_status=upstream_status)
+
+
 def _get_poma_client():
     """Instantiate the POMA SDK client.
 
@@ -60,7 +137,9 @@ def poma_chunk_file(file_path: str) -> dict[str, Any]:
     try:
         start_resp = client.start_chunk_file(file_path)
     except Exception as e:
+        _raise_if_poma_too_many_jobs_error(e)
         raise RuntimeError(f"POMA start_chunk_file failed: {e}") from e
+    _raise_if_poma_too_many_jobs_response(start_resp)
 
     job_id = start_resp.get("job_id") #_extract_job_id(start_resp)
     if not job_id:
@@ -71,6 +150,7 @@ def poma_chunk_file(file_path: str) -> dict[str, Any]:
     while time.time() - t0 <= POMA_TIMEOUT_SECONDS:
         try:
             res = client.get_chunk_result(job_id)
+            _raise_if_poma_too_many_jobs_response(res)
 
             # Common patterns: {"status": "processing"} while running.
             if isinstance(res, dict):
@@ -90,6 +170,7 @@ def poma_chunk_file(file_path: str) -> dict[str, Any]:
             # If we get here: keep polling.
             time.sleep(POMA_POLL_INTERVAL_SECONDS)
         except Exception as e:
+            _raise_if_poma_too_many_jobs_error(e)
             last_err = e
             time.sleep(POMA_POLL_INTERVAL_SECONDS)
 

@@ -18,6 +18,7 @@ from fastapi import (
     Query,
     status,
 )
+from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -58,6 +59,7 @@ from app.utils.document_loader import (
 from app.utils.health import is_health_ok
 
 from app.services.poma_bridge import (
+    PomaTooManyJobsError,
     poma_chunk_file,
     poma_store_chunking_result,
     poma_delete_chunking_result,
@@ -946,6 +948,25 @@ async def embed_file(
             http_exc.detail,
         )
         raise http_exc
+    except PomaTooManyJobsError as e:
+        response_status = False
+        response_message = "Too many jobs"
+        payload = {
+            "code": "TOO_MANY_JOBS",
+            "detail": "Too many jobs",
+            "message": "Too many jobs",
+        }
+        if e.upstream_status is not None:
+            payload["upstream_status"] = e.upstream_status
+        logger.warning(
+            "POMA rejected chunking due to job limit | File ID: %s | Upstream status: %s",
+            file_id,
+            e.upstream_status,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=payload,
+        )
     except Exception as e:
         response_status = False
         response_message = f"Error during file processing: {str(e)}"
