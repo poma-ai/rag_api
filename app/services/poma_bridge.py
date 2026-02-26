@@ -20,9 +20,41 @@ class PomaTooManyJobsError(RuntimeError):
         message: str = "Too many jobs",
         *,
         upstream_status: int | None = None,
+        upstream_detail: str | None = None,
+        upstream_code: str | int | None = None,
     ) -> None:
         super().__init__(message)
         self.upstream_status = upstream_status
+        self.upstream_detail = upstream_detail
+        self.upstream_code = upstream_code
+
+
+class PomaRetryableUpstreamError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        upstream_status: int | None = None,
+        upstream_detail: str | None = None,
+        upstream_code: str | int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+        self.upstream_detail = upstream_detail
+        self.upstream_code = upstream_code
+
+
+class PomaJobFailedError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        upstream_status: int | None = None,
+        job_status: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.upstream_status = upstream_status
+        self.job_status = job_status
 
 
 def _safe_int(value: Any) -> int | None:
@@ -45,6 +77,51 @@ def _extract_error_message(obj: Any) -> str:
     return str(obj)
 
 
+def _extract_upstream_code(obj: Any) -> str | int | None:
+    if not isinstance(obj, dict):
+        return None
+    code = obj.get("code")
+    if isinstance(code, (str, int)):
+        return code
+    return None
+
+
+def _parse_json_dict_if_possible(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_upstream_detail_and_code(obj: Any) -> tuple[str | None, str | int | None]:
+    if obj is None:
+        return None, None
+
+    if isinstance(obj, dict):
+        detail = _extract_error_message(obj)
+        return (detail if detail else None), _extract_upstream_code(obj)
+
+    if isinstance(obj, str):
+        text = obj.strip()
+        if not text:
+            return None, None
+        parsed = _parse_json_dict_if_possible(text)
+        if parsed is not None:
+            return _extract_upstream_detail_and_code(parsed)
+        return text, None
+
+    return str(obj), None
+
+
 def _extract_upstream_status_from_error(err: Exception) -> int | None:
     for attr in ("status_code", "status", "http_status"):
         status = _safe_int(getattr(err, attr, None))
@@ -61,16 +138,86 @@ def _extract_upstream_status_from_error(err: Exception) -> int | None:
     return None
 
 
+def _extract_upstream_status_from_response(resp: Any) -> int | None:
+    if not isinstance(resp, dict):
+        return None
+
+    for key in ("status_code", "http_status", "status", "code"):
+        status = _safe_int(resp.get(key))
+        if status is not None:
+            return status
+
+    return None
+
+
 def _is_too_many_jobs_message(message: str) -> bool:
     lowered = message.lower()
     return "too many jobs" in lowered
 
 
+def _is_retryable_create_job_failure_message(message: str) -> bool:
+    lowered = message.lower()
+    return "failed to create job" in lowered
+
+
+def _is_terminal_job_failure_message(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "job failed" in lowered
+        or "job cancelled" in lowered
+        or "job canceled" in lowered
+    )
+
+
+def _is_terminal_job_status(status: str) -> bool:
+    return status in {"failed", "error", "cancelled", "canceled"}
+
+
+def _get_http_response_from_exception(err: Exception) -> tuple[int | None, str]:
+    """Extract HTTP status code and response body from an exception (e.g. httpx.HTTPStatusError or POMA RemoteServerError)."""
+    ex: Exception | None = err
+    while ex is not None:
+        if hasattr(ex, "response") and ex.response is not None:
+            resp = ex.response
+            try:
+                status: int | None = getattr(resp, "status_code", None)
+            except Exception:
+                status = None
+            try:
+                body = resp.text
+            except Exception:
+                try:
+                    body = (getattr(resp, "content", None) or b"").decode(
+                        "utf-8", errors="replace"
+                    )
+                except Exception:
+                    body = repr(resp)
+            return status, body
+        ex = getattr(ex, "__cause__", None)
+    return None, ""
+
+
+def _extract_upstream_detail_and_code_from_error(
+    err: Exception,
+) -> tuple[str | None, str | int | None]:
+    detail, code = _extract_upstream_detail_and_code(getattr(err, "response_body", None))
+    if detail is not None or code is not None:
+        return detail, code
+
+    _, body = _get_http_response_from_exception(err)
+    return _extract_upstream_detail_and_code(body)
+
+
 def _raise_if_poma_too_many_jobs_error(err: Exception) -> None:
-    if _is_too_many_jobs_message(str(err)):
+    upstream_status = _extract_upstream_status_from_error(err)
+    upstream_detail, upstream_code = _extract_upstream_detail_and_code_from_error(err)
+    match_text = upstream_detail or str(err)
+    if _is_too_many_jobs_message(match_text):
         raise PomaTooManyJobsError(
             "Too many jobs",
-            upstream_status=_extract_upstream_status_from_error(err),
+            upstream_status=upstream_status,
+            upstream_detail=upstream_detail,
+            upstream_code=upstream_code,
         ) from err
 
 
@@ -78,17 +225,105 @@ def _raise_if_poma_too_many_jobs_response(resp: Any) -> None:
     if not isinstance(resp, dict):
         return
 
-    message = _extract_error_message(resp)
+    message, upstream_code = _extract_upstream_detail_and_code(resp)
     if not _is_too_many_jobs_message(message):
         return
 
+    upstream_status = _extract_upstream_status_from_response(resp)
+
+    raise PomaTooManyJobsError(
+        "Too many jobs",
+        upstream_status=upstream_status,
+        upstream_detail=message,
+        upstream_code=upstream_code,
+    )
+
+
+def _is_retryable_poma_create_job_failure(
+    *, upstream_status: int | None, upstream_detail: str | None
+) -> bool:
+    if not upstream_detail or not _is_retryable_create_job_failure_message(upstream_detail):
+        return False
+
+    # POMA currently returns a generic "Failed to create job" for transient capacity/job creation
+    # problems. Treat these as retryable regardless of whether upstream used 400 or 5xx.
+    return upstream_status in {None, 400, 403, 429, 500, 502, 503, 504}
+
+
+def _raise_if_poma_retryable_create_job_error(err: Exception) -> None:
+    upstream_status = _extract_upstream_status_from_error(err)
+    upstream_detail, upstream_code = _extract_upstream_detail_and_code_from_error(err)
+    if not _is_retryable_poma_create_job_failure(
+        upstream_status=upstream_status,
+        upstream_detail=upstream_detail,
+    ):
+        return
+
+    raise PomaRetryableUpstreamError(
+        "POMA temporarily failed to create a chunking job",
+        upstream_status=upstream_status,
+        upstream_detail=upstream_detail,
+        upstream_code=upstream_code,
+    ) from err
+
+
+def _raise_if_poma_retryable_create_job_response(resp: Any) -> None:
+    if not isinstance(resp, dict):
+        return
+
+    upstream_detail, upstream_code = _extract_upstream_detail_and_code(resp)
+    upstream_status = _extract_upstream_status_from_response(resp)
+    if not _is_retryable_poma_create_job_failure(
+        upstream_status=upstream_status,
+        upstream_detail=upstream_detail,
+    ):
+        return
+
+    raise PomaRetryableUpstreamError(
+        "POMA temporarily failed to create a chunking job",
+        upstream_status=upstream_status,
+        upstream_detail=upstream_detail,
+        upstream_code=upstream_code,
+    )
+
+
+def _raise_if_poma_terminal_job_failure_error(err: Exception) -> None:
+    message = str(err)
+    if not _is_terminal_job_failure_message(message):
+        return
+
+    raise PomaJobFailedError(
+        message,
+        upstream_status=_extract_upstream_status_from_error(err),
+    ) from err
+
+
+def _raise_if_poma_terminal_job_failure_response(resp: Any) -> None:
+    if not isinstance(resp, dict):
+        return
+
+    status_value = resp.get("status")
+    status_text = str(status_value).lower() if status_value is not None else ""
+    if not _is_terminal_job_status(status_text):
+        return
+
+    detail = _extract_error_message(resp)
+    if detail and detail.lower() != status_text:
+        message = f"POMA job failed (status={status_text}): {detail}"
+    else:
+        message = f"POMA job failed (status={status_text})"
+
     upstream_status = None
-    for key in ("status_code", "status", "code"):
+    for key in ("status_code", "http_status", "error_code", "code"):
         upstream_status = _safe_int(resp.get(key))
         if upstream_status is not None:
             break
 
-    raise PomaTooManyJobsError("Too many jobs", upstream_status=upstream_status)
+    raise PomaJobFailedError(
+        message,
+        upstream_status=upstream_status,
+        job_status=status_text,
+    )
 
 
 def _get_poma_client():
@@ -133,13 +368,51 @@ def poma_chunk_file(file_path: str) -> dict[str, Any]:
     """Run POMA structural chunking on a file path and return {chunks, chunksets}."""
 
     client = _get_poma_client()
+    file_name = os.path.basename(file_path)
+    poll_count = 0
+
+    logger.info(
+        "POMA chunking start | file=%s | file_path=%s",
+        file_name,
+        file_path,
+    )
 
     try:
         start_resp = client.start_chunk_file(file_path)
     except Exception as e:
         _raise_if_poma_too_many_jobs_error(e)
+        _raise_if_poma_retryable_create_job_error(e)
+        status_code, body = _get_http_response_from_exception(e)
+        logger.error(
+            "POMA start_chunk_file exception | file=%s | error=%s",
+            file_name,
+            str(e),
+        )
+        logger.error(
+            "POMA start_chunk_file error response (full) | file=%s | status_code=%s | body=%s",
+            file_name,
+            status_code,
+            body or "(no body)",
+        )
         raise RuntimeError(f"POMA start_chunk_file failed: {e}") from e
     _raise_if_poma_too_many_jobs_response(start_resp)
+    _raise_if_poma_retryable_create_job_response(start_resp)
+
+    if isinstance(start_resp, dict):
+        logger.info(
+            "POMA chunking job created | file=%s | job_id=%s | status=%s | response_keys=%s",
+            file_name,
+            start_resp.get("job_id"),
+            start_resp.get("status"),
+            sorted(start_resp.keys()),
+        )
+    else:
+        logger.info(
+            "POMA chunking start response (non-dict) | file=%s | type=%s | response=%s",
+            file_name,
+            type(start_resp).__name__,
+            start_resp,
+        )
 
     job_id = start_resp.get("job_id") #_extract_job_id(start_resp)
     if not job_id:
@@ -150,35 +423,130 @@ def poma_chunk_file(file_path: str) -> dict[str, Any]:
     while time.time() - t0 <= POMA_TIMEOUT_SECONDS:
         try:
             res = client.get_chunk_result(job_id)
+            poll_count += 1
             _raise_if_poma_too_many_jobs_response(res)
+            _raise_if_poma_terminal_job_failure_response(res)
 
             # Common patterns: {"status": "processing"} while running.
             if isinstance(res, dict):
                 status = str(res.get("status", "")).lower()
+                has_chunks = "chunks" in res
+                has_chunksets = "chunksets" in res
+                nested = res.get("result") or res.get("data")
+                nested_keys = (
+                    sorted(nested.keys()) if isinstance(nested, dict) else None
+                )
+                logger.info(
+                    "POMA poll | file=%s | job_id=%s | attempt=%d | status=%s | has_chunks=%s | has_chunksets=%s | response_keys=%s | nested_keys=%s",
+                    file_name,
+                    job_id,
+                    poll_count,
+                    status or "<missing>",
+                    has_chunks,
+                    has_chunksets,
+                    sorted(res.keys()),
+                    nested_keys,
+                )
                 if status in {"processing", "queued", "running", "pending"}:
                     time.sleep(POMA_POLL_INTERVAL_SECONDS)
                     continue
 
-                if "chunks" in res and "chunksets" in res:
+                if has_chunks and has_chunksets:
+                    logger.info(
+                        "POMA chunking complete (direct payload) | file=%s | job_id=%s | attempts=%d | chunks=%s | chunksets=%s",
+                        file_name,
+                        job_id,
+                        poll_count,
+                        len(res.get("chunks", [])) if isinstance(res.get("chunks"), list) else "n/a",
+                        len(res.get("chunksets", [])) if isinstance(res.get("chunksets"), list) else "n/a",
+                    )
                     return res
 
                 # Sometimes the SDK may return the payload nested.
-                nested = res.get("result") or res.get("data")
                 if isinstance(nested, dict) and "chunks" in nested and "chunksets" in nested:
+                    logger.info(
+                        "POMA chunking complete (nested payload) | file=%s | job_id=%s | attempts=%d | nested_chunks=%s | nested_chunksets=%s",
+                        file_name,
+                        job_id,
+                        poll_count,
+                        len(nested.get("chunks", [])) if isinstance(nested.get("chunks"), list) else "n/a",
+                        len(nested.get("chunksets", [])) if isinstance(nested.get("chunksets"), list) else "n/a",
+                    )
                     return nested
+
+                if status in {"completed", "complete", "success", "succeeded", "done"}:
+                    logger.warning(
+                        "POMA reported terminal success status but payload missing chunks/chunksets; continuing to poll | file=%s | job_id=%s | attempt=%d | status=%s | response_keys=%s",
+                        file_name,
+                        job_id,
+                        poll_count,
+                        status,
+                        sorted(res.keys()),
+                    )
+            else:
+                logger.info(
+                    "POMA poll (non-dict response) | file=%s | job_id=%s | attempt=%d | type=%s | response=%s",
+                    file_name,
+                    job_id,
+                    poll_count,
+                    type(res).__name__,
+                    res,
+                )
 
             # If we get here: keep polling.
             time.sleep(POMA_POLL_INTERVAL_SECONDS)
         except Exception as e:
             _raise_if_poma_too_many_jobs_error(e)
+            _raise_if_poma_terminal_job_failure_error(e)
+            status_code, body = _get_http_response_from_exception(e)
+            logger.warning(
+                "POMA poll exception; will retry until timeout | file=%s | job_id=%s | attempt=%d | error=%s",
+                file_name,
+                job_id,
+                poll_count,
+                str(e),
+            )
+            if body or status_code is not None:
+                logger.warning(
+                    "POMA poll error response (full) | file=%s | job_id=%s | attempt=%d | status_code=%s | body=%s",
+                    file_name,
+                    job_id,
+                    poll_count,
+                    status_code,
+                    body or "(no body)",
+                )
             last_err = e
             time.sleep(POMA_POLL_INTERVAL_SECONDS)
 
     if last_err is not None:
+        status_code, body = _get_http_response_from_exception(last_err)
+        logger.error(
+            "POMA chunking timeout with last error | file=%s | job_id=%s | attempts=%d | timeout_seconds=%s | last_error=%s",
+            file_name,
+            job_id,
+            poll_count,
+            POMA_TIMEOUT_SECONDS,
+            str(last_err),
+        )
+        if body or status_code is not None:
+            logger.error(
+                "POMA chunking timeout last error response (full) | file=%s | job_id=%s | status_code=%s | body=%s",
+                file_name,
+                job_id,
+                status_code,
+                body or "(no body)",
+            )
         raise RuntimeError(
             f"Timed out waiting for POMA chunking result after {POMA_TIMEOUT_SECONDS}s. "
             f"Last error: {last_err}"
         )
+    logger.error(
+        "POMA chunking timeout without explicit last error | file=%s | job_id=%s | attempts=%d | timeout_seconds=%s",
+        file_name,
+        job_id,
+        poll_count,
+        POMA_TIMEOUT_SECONDS,
+    )
     raise RuntimeError(
         f"Timed out waiting for POMA chunking result after {POMA_TIMEOUT_SECONDS}s."
     )

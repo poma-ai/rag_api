@@ -24,6 +24,7 @@ from langchain_core.runnables import run_in_executor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from functools import lru_cache
 import asyncio
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from app.services.vector_store.async_pg_vector import AsyncPgVector
@@ -59,6 +60,8 @@ from app.utils.document_loader import (
 from app.utils.health import is_health_ok
 
 from app.services.poma_bridge import (
+    PomaJobFailedError,
+    PomaRetryableUpstreamError,
     PomaTooManyJobsError,
     poma_chunk_file,
     poma_store_chunking_result,
@@ -83,6 +86,17 @@ def get_user_id(request: Request, entity_id: str = None) -> str:
         return entity_id if entity_id else "public"
     else:
         return entity_id if entity_id else request.state.user.get("id")
+
+
+def _new_poma_trace_id() -> str:
+    return uuid4().hex[:12]
+
+
+def _safe_file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
@@ -721,6 +735,8 @@ async def store_data_in_vector_db(
     executor=None,
     source_file_path: str | None = None,
     source_filename: str | None = None,
+    poma_trace_id: str | None = None,
+    poma_route: str | None = None,
 ) -> bool:
     loop = asyncio.get_running_loop()
 
@@ -731,11 +747,37 @@ async def store_data_in_vector_db(
                 detail="CHUNKER_PROVIDER=poma requires source_file_path",
             )
 
+        logger.info(
+            "POMA pipeline dispatch | trace=%s | route=%s | file_id=%s | filename=%s | user_id=%s | source_file_path=%s",
+            poma_trace_id,
+            poma_route,
+            file_id,
+            source_filename,
+            user_id,
+            source_file_path,
+        )
+
         # Run the (blocking) POMA chunking call in the executor.
         chunking_result = await loop.run_in_executor(
             executor,
             poma_chunk_file,
             source_file_path,
+        )
+
+        logger.info(
+            "POMA pipeline chunking result received | trace=%s | route=%s | file_id=%s | result_keys=%s | chunks=%s | chunksets=%s",
+            poma_trace_id,
+            poma_route,
+            file_id,
+            sorted(chunking_result.keys()) if isinstance(chunking_result, dict) else None,
+            len(chunking_result.get("chunks", []))
+            if isinstance(chunking_result, dict)
+            and isinstance(chunking_result.get("chunks"), list)
+            else "n/a",
+            len(chunking_result.get("chunksets", []))
+            if isinstance(chunking_result, dict)
+            and isinstance(chunking_result.get("chunksets"), list)
+            else "n/a",
         )
 
         # Cache chunks+chunksets locally for later cheatsheet assembly.
@@ -749,9 +791,17 @@ async def store_data_in_vector_db(
                     result=chunking_result,
                 ),
             )
+            logger.info(
+                "POMA pipeline cache write complete | trace=%s | route=%s | file_id=%s",
+                poma_trace_id,
+                poma_route,
+                file_id,
+            )
         except Exception:
             logger.warning(
-                "Failed to cache POMA chunking result for file_id=%s | Traceback: %s",
+                "Failed to cache POMA chunking result | trace=%s | route=%s | file_id=%s | Traceback: %s",
+                poma_trace_id,
+                poma_route,
                 file_id,
                 traceback.format_exc(),
             )
@@ -762,6 +812,13 @@ async def store_data_in_vector_db(
             lambda: poma_chunksets_to_documents(
                 file_id=file_id, user_id=user_id, chunking_result=chunking_result
             ),
+        )
+        logger.info(
+            "POMA pipeline documents prepared from chunksets | trace=%s | route=%s | file_id=%s | docs=%d",
+            poma_trace_id,
+            poma_route,
+            file_id,
+            len(docs),
         )
     else:
         # Run document preparation in executor to avoid blocking the event loop
@@ -775,6 +832,16 @@ async def store_data_in_vector_db(
         )
 
     try:
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA pipeline vector insert start | trace=%s | route=%s | file_id=%s | docs=%d | embedding_batch_size=%s | vector_store=%s",
+                poma_trace_id,
+                poma_route,
+                file_id,
+                len(docs),
+                EMBEDDING_BATCH_SIZE,
+                type(vector_store).__name__,
+            )
         if EMBEDDING_BATCH_SIZE <= 0:
             # synchronously embed the file and insert into vector store in one go
             if isinstance(vector_store, AsyncPgVector):
@@ -798,13 +865,23 @@ async def store_data_in_vector_db(
                     docs, file_id, vector_store, executor
                 )
 
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA pipeline vector insert complete | trace=%s | route=%s | file_id=%s | inserted_ids=%d",
+                poma_trace_id,
+                poma_route,
+                file_id,
+                len(ids) if isinstance(ids, list) else 0,
+            )
         return {"message": "Documents added successfully", "ids": ids}
 
     except Exception as e:
         logger.error(
-            "Failed to store data in vector DB | File ID: %s | User ID: %s | Error: %s | Traceback: %s",
+            "Failed to store data in vector DB | File ID: %s | User ID: %s | POMA trace: %s | POMA route: %s | Error: %s | Traceback: %s",
             file_id,
             user_id,
+            poma_trace_id,
+            poma_route,
             str(e),
             traceback.format_exc(),
         )
@@ -826,11 +903,31 @@ async def embed_local_file(
         user_id = entity_id if entity_id else "public"
     else:
         user_id = entity_id if entity_id else request.state.user.get("id")
+    poma_trace_id = _new_poma_trace_id() if CHUNKER_PROVIDER == "poma" else None
+
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route request start | route=/local/embed | trace=%s | file_id=%s | filename=%s | user_id=%s | filepath=%s | content_type=%s",
+            poma_trace_id,
+            document.file_id,
+            document.filename,
+            user_id,
+            document.filepath,
+            document.file_content_type,
+        )
 
     try:
         loader, known_type, file_ext = get_loader(
             document.filename, document.file_content_type, document.filepath
         )
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route file metadata resolved | route=/local/embed | trace=%s | file_id=%s | known_type=%s | file_ext=%s",
+                poma_trace_id,
+                document.file_id,
+                known_type,
+                file_ext,
+            )
 
         if CHUNKER_PROVIDER == "poma":
             data = []
@@ -847,9 +944,27 @@ async def embed_local_file(
             executor=request.app.state.thread_pool,
             source_file_path=document.filepath,
             source_filename=document.filename,
+            poma_trace_id=poma_trace_id,
+            poma_route="/local/embed",
         )
 
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route store_data_in_vector_db returned | route=/local/embed | trace=%s | file_id=%s | result_keys=%s | has_error=%s",
+                poma_trace_id,
+                document.file_id,
+                sorted(result.keys()) if isinstance(result, dict) else None,
+                isinstance(result, dict) and "error" in result,
+            )
+
         if result:
+            if CHUNKER_PROVIDER == "poma":
+                logger.info(
+                    "POMA route request success | route=/local/embed | trace=%s | file_id=%s | filename=%s",
+                    poma_trace_id,
+                    document.file_id,
+                    document.filename,
+                )
             return {
                 "status": True,
                 "file_id": document.file_id,
@@ -863,13 +978,19 @@ async def embed_local_file(
             )
     except HTTPException as http_exc:
         logger.error(
-            "HTTP Exception in embed_local_file | Status: %d | Detail: %s",
+            "HTTP Exception in embed_local_file | POMA trace: %s | Status: %d | Detail: %s",
+            poma_trace_id,
             http_exc.status_code,
             http_exc.detail,
         )
         raise http_exc
     except Exception as e:
-        logger.error(e)
+        logger.error(
+            "Error in embed_local_file | POMA trace: %s | Error: %s | Traceback: %s",
+            poma_trace_id,
+            str(e),
+            traceback.format_exc(),
+        )
         if "No pandoc was found" in str(e):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -892,19 +1013,46 @@ async def embed_file(
     response_status = True
     response_message = "File processed successfully."
     known_type = None
+    poma_trace_id = _new_poma_trace_id() if CHUNKER_PROVIDER == "poma" else None
 
     user_id = get_user_id(request, entity_id)
     temp_base_path = os.path.join(RAG_UPLOAD_DIR, user_id)
     os.makedirs(temp_base_path, exist_ok=True)
     temp_file_path = os.path.join(RAG_UPLOAD_DIR, user_id, file.filename)
 
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route request start | route=/embed | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s",
+            poma_trace_id,
+            file_id,
+            file.filename,
+            user_id,
+            file.content_type,
+        )
+
     await save_upload_file_async(file, temp_file_path)
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route upload saved | route=/embed | trace=%s | file_id=%s | temp_file_path=%s | size_bytes=%s",
+            poma_trace_id,
+            file_id,
+            temp_file_path,
+            _safe_file_size(temp_file_path),
+        )
 
     try:
         # Determine file type without necessarily loading/extracting content.
         loader, known_type, file_ext = get_loader(
             file.filename, file.content_type, temp_file_path
         )
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route file metadata resolved | route=/embed | trace=%s | file_id=%s | known_type=%s | file_ext=%s",
+                poma_trace_id,
+                file_id,
+                known_type,
+                file_ext,
+            )
 
         if CHUNKER_PROVIDER == "poma":
             data = []
@@ -920,7 +1068,18 @@ async def embed_file(
             executor=request.app.state.thread_pool,
             source_file_path=temp_file_path,
             source_filename=file.filename,
+            poma_trace_id=poma_trace_id,
+            poma_route="/embed",
         )
+
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route store_data_in_vector_db returned | route=/embed | trace=%s | file_id=%s | result_keys=%s | has_error=%s",
+                poma_trace_id,
+                file_id,
+                sorted(result.keys()) if isinstance(result, dict) else None,
+                isinstance(result, dict) and "error" in result,
+            )
 
         if not result:
             response_status = False
@@ -943,7 +1102,8 @@ async def embed_file(
         response_status = False
         response_message = f"HTTP Exception: {http_exc.detail}"
         logger.error(
-            "HTTP Exception in embed_file | Status: %d | Detail: %s",
+            "HTTP Exception in embed_file | POMA trace: %s | Status: %d | Detail: %s",
+            poma_trace_id,
             http_exc.status_code,
             http_exc.detail,
         )
@@ -955,23 +1115,87 @@ async def embed_file(
             "code": "TOO_MANY_JOBS",
             "detail": "Too many jobs",
             "message": "Too many jobs",
+            "retryable": True,
+            "source": "poma",
         }
         if e.upstream_status is not None:
             payload["upstream_status"] = e.upstream_status
+        if e.upstream_code is not None:
+            payload["upstream_code"] = e.upstream_code
+        if e.upstream_detail:
+            payload["upstream_detail"] = e.upstream_detail
         logger.warning(
-            "POMA rejected chunking due to job limit | File ID: %s | Upstream status: %s",
+            "POMA rejected chunking due to job limit | route=/embed | trace=%s | File ID: %s | Upstream status: %s | Upstream code: %s | Upstream detail: %s",
+            poma_trace_id,
             file_id,
             e.upstream_status,
+            e.upstream_code,
+            e.upstream_detail,
         )
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content=payload,
         )
+    except PomaRetryableUpstreamError as e:
+        response_status = False
+        response_message = str(e)
+        payload = {
+            "code": "POMA_RETRYABLE_UPSTREAM_ERROR",
+            "detail": str(e),
+            "message": str(e),
+            "retryable": True,
+            "source": "poma",
+        }
+        if e.upstream_status is not None:
+            payload["upstream_status"] = e.upstream_status
+        if e.upstream_code is not None:
+            payload["upstream_code"] = e.upstream_code
+        if e.upstream_detail:
+            payload["upstream_detail"] = e.upstream_detail
+        logger.warning(
+            "POMA retryable upstream create-job failure | route=/embed | trace=%s | File ID: %s | Upstream status: %s | Upstream code: %s | Upstream detail: %s",
+            poma_trace_id,
+            file_id,
+            e.upstream_status,
+            e.upstream_code,
+            e.upstream_detail,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=payload,
+        )
+    except PomaJobFailedError as e:
+        response_status = False
+        response_message = str(e)
+        status_code = (
+            e.upstream_status
+            if isinstance(e.upstream_status, int) and 400 <= e.upstream_status <= 599
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        payload = {
+            "code": "POMA_JOB_FAILED",
+            "detail": str(e),
+            "message": str(e),
+        }
+        if e.upstream_status is not None:
+            payload["upstream_status"] = e.upstream_status
+        if e.job_status:
+            payload["job_status"] = e.job_status
+        logger.error(
+            "POMA job failed during /embed | trace=%s | File ID: %s | Status: %s | Upstream status: %s | Detail: %s",
+            poma_trace_id,
+            file_id,
+            e.job_status,
+            e.upstream_status,
+            str(e),
+        )
+        return JSONResponse(status_code=status_code, content=payload)
     except Exception as e:
         response_status = False
         response_message = f"Error during file processing: {str(e)}"
         logger.error(
-            "Error during file processing: %s\nTraceback: %s",
+            "Error during file processing | route=/embed | trace=%s | error=%s\nTraceback: %s",
+            poma_trace_id,
             str(e),
             traceback.format_exc(),
         )
@@ -981,7 +1205,21 @@ async def embed_file(
         )
     finally:
         await cleanup_temp_file_async(temp_file_path)
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route cleanup complete | route=/embed | trace=%s | file_id=%s | temp_file_path=%s",
+                poma_trace_id,
+                file_id,
+                temp_file_path,
+            )
 
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route request success | route=/embed | trace=%s | file_id=%s | filename=%s",
+            poma_trace_id,
+            file_id,
+            file.filename,
+        )
     return {
         "status": response_status,
         "message": response_message,
@@ -1048,13 +1286,40 @@ async def embed_file_upload(
 ):
     user_id = get_user_id(request, entity_id)
     temp_file_path = os.path.join(RAG_UPLOAD_DIR, uploaded_file.filename)
+    poma_trace_id = _new_poma_trace_id() if CHUNKER_PROVIDER == "poma" else None
+
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route request start | route=/embed-upload | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s",
+            poma_trace_id,
+            file_id,
+            uploaded_file.filename,
+            user_id,
+            uploaded_file.content_type,
+        )
 
     await save_upload_file_async(uploaded_file, temp_file_path)
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route upload saved | route=/embed-upload | trace=%s | file_id=%s | temp_file_path=%s | size_bytes=%s",
+            poma_trace_id,
+            file_id,
+            temp_file_path,
+            _safe_file_size(temp_file_path),
+        )
 
     try:
         loader, known_type, file_ext = get_loader(
             uploaded_file.filename, uploaded_file.content_type, temp_file_path
         )
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route file metadata resolved | route=/embed-upload | trace=%s | file_id=%s | known_type=%s | file_ext=%s",
+                poma_trace_id,
+                file_id,
+                known_type,
+                file_ext,
+            )
 
         if CHUNKER_PROVIDER == "poma":
             data = []
@@ -1070,7 +1335,18 @@ async def embed_file_upload(
             executor=request.app.state.thread_pool,
             source_file_path=temp_file_path,
             source_filename=uploaded_file.filename,
+            poma_trace_id=poma_trace_id,
+            poma_route="/embed-upload",
         )
+
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route store_data_in_vector_db returned | route=/embed-upload | trace=%s | file_id=%s | result_keys=%s | has_error=%s",
+                poma_trace_id,
+                file_id,
+                sorted(result.keys()) if isinstance(result, dict) else None,
+                isinstance(result, dict) and "error" in result,
+            )
 
         if not result:
             raise HTTPException(
@@ -1079,14 +1355,16 @@ async def embed_file_upload(
             )
     except HTTPException as http_exc:
         logger.error(
-            "HTTP Exception in embed_file_upload | Status: %d | Detail: %s",
+            "HTTP Exception in embed_file_upload | POMA trace: %s | Status: %d | Detail: %s",
+            poma_trace_id,
             http_exc.status_code,
             http_exc.detail,
         )
         raise http_exc
     except Exception as e:
         logger.error(
-            "Error during file processing | File: %s | Error: %s | Traceback: %s",
+            "Error during file processing | route=/embed-upload | trace=%s | File: %s | Error: %s | Traceback: %s",
+            poma_trace_id,
             uploaded_file.filename,
             str(e),
             traceback.format_exc(),
@@ -1097,7 +1375,21 @@ async def embed_file_upload(
         )
     finally:
         await cleanup_temp_file_async(temp_file_path)
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route cleanup complete | route=/embed-upload | trace=%s | file_id=%s | temp_file_path=%s",
+                poma_trace_id,
+                file_id,
+                temp_file_path,
+            )
 
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA route request success | route=/embed-upload | trace=%s | file_id=%s | filename=%s",
+            poma_trace_id,
+            file_id,
+            uploaded_file.filename,
+        )
     return {
         "status": True,
         "message": "File processed successfully.",

@@ -261,7 +261,12 @@ def test_embed_file_too_many_jobs_returns_structured_403(
     test_file.write_text(file_content)
 
     def raise_too_many_jobs(_file_path):
-        raise PomaTooManyJobsError("Too many jobs", upstream_status=403)
+        raise PomaTooManyJobsError(
+            "Too many jobs",
+            upstream_status=403,
+            upstream_detail="Too many jobs",
+            upstream_code="TOO_MANY_JOBS",
+        )
 
     monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
     monkeypatch.setattr(document_routes, "poma_chunk_file", raise_too_many_jobs)
@@ -280,6 +285,87 @@ def test_embed_file_too_many_jobs_returns_structured_403(
     assert json_data["detail"] == "Too many jobs"
     assert json_data["message"] == "Too many jobs"
     assert json_data["upstream_status"] == 403
+    assert json_data["upstream_code"] == "TOO_MANY_JOBS"
+    assert json_data["upstream_detail"] == "Too many jobs"
+    assert json_data["retryable"] is True
+    assert json_data["source"] == "poma"
+
+
+def test_embed_file_poma_retryable_upstream_error_returns_structured_503(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+    from app.services.poma_bridge import PomaRetryableUpstreamError
+
+    file_content = "This should trigger a mocked retryable POMA create-job error."
+    test_file = tmp_path / "poma_retryable_create_job.txt"
+    test_file.write_text(file_content)
+
+    def raise_retryable_poma_error(_file_path):
+        raise PomaRetryableUpstreamError(
+            "POMA temporarily failed to create a chunking job",
+            upstream_status=400,
+            upstream_detail="Failed to create job",
+            upstream_code=400,
+        )
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
+    monkeypatch.setattr(document_routes, "poma_chunk_file", raise_retryable_poma_error)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("poma_retryable_create_job.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 503, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "POMA_RETRYABLE_UPSTREAM_ERROR"
+    assert json_data["message"] == "POMA temporarily failed to create a chunking job"
+    assert json_data["detail"] == "POMA temporarily failed to create a chunking job"
+    assert json_data["upstream_status"] == 400
+    assert json_data["upstream_code"] == 400
+    assert json_data["upstream_detail"] == "Failed to create job"
+    assert json_data["retryable"] is True
+    assert json_data["source"] == "poma"
+
+
+def test_embed_file_poma_job_failed_returns_upstream_status(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+    from app.services.poma_bridge import PomaJobFailedError
+
+    file_content = "This should trigger a mocked terminal POMA job failure."
+    test_file = tmp_path / "poma_job_failed.txt"
+    test_file.write_text(file_content)
+
+    def raise_poma_job_failed(_file_path):
+        raise PomaJobFailedError(
+            "POMA-AI job polling failed: Job failed: Job failed with code 503: No details provided.",
+            upstream_status=503,
+            job_status="failed",
+        )
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
+    monkeypatch.setattr(document_routes, "poma_chunk_file", raise_poma_job_failed)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("poma_job_failed.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 503, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "POMA_JOB_FAILED"
+    assert "Job failed" in json_data["detail"]
+    assert json_data["upstream_status"] == 503
+    assert json_data["job_status"] == "failed"
 
 
 def test_embed_file_unrelated_poma_error_not_misclassified(
