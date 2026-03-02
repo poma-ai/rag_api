@@ -332,6 +332,145 @@ def test_embed_file_poma_retryable_upstream_error_returns_structured_503(
     assert json_data["source"] == "poma"
 
 
+def test_embed_file_retryable_store_error_returns_structured_503(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    file_content = "This should trigger a mocked transient vector DB error."
+    test_file = tmp_path / "vector_db_retryable.txt"
+    test_file.write_text(file_content)
+
+    async def mocked_store_error(*args, **kwargs):
+        return {
+            "message": "An error occurred while adding documents.",
+            "error": "SSL SYSCALL error: EOF detected",
+            "code": "VECTOR_DB_TRANSIENT_ERROR",
+            "retryable": True,
+            "source": "vector_db",
+            "attempts": 3,
+        }
+
+    monkeypatch.setattr(document_routes, "store_data_in_vector_db", mocked_store_error)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("vector_db_retryable.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 503, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "VECTOR_DB_TRANSIENT_ERROR"
+    assert json_data["retryable"] is True
+    assert json_data["source"] == "vector_db"
+    assert json_data["attempts"] == 3
+    assert "EOF detected" in json_data["detail"]
+
+
+def test_embed_local_file_store_error_not_reported_as_success(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    test_file = tmp_path / "local_store_error.txt"
+    test_file.write_text("content")
+
+    async def mocked_store_error(*args, **kwargs):
+        return {
+            "message": "An error occurred while adding documents.",
+            "error": "SSL SYSCALL error: EOF detected",
+            "code": "VECTOR_DB_TRANSIENT_ERROR",
+            "retryable": True,
+            "source": "vector_db",
+            "attempts": 3,
+        }
+
+    monkeypatch.setattr(document_routes, "store_data_in_vector_db", mocked_store_error)
+
+    data = {
+        "filepath": str(test_file),
+        "filename": "local_store_error.txt",
+        "file_content_type": "text/plain",
+        "file_id": "testid1",
+    }
+    response = client.post("/local/embed", json=data, headers=auth_headers)
+    assert response.status_code == 503, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "VECTOR_DB_TRANSIENT_ERROR"
+    assert json_data["retryable"] is True
+    assert json_data["source"] == "vector_db"
+
+
+def test_embed_file_upload_store_error_not_reported_as_success(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    test_file = tmp_path / "upload_store_error.txt"
+    test_file.write_text("content")
+
+    async def mocked_store_error(*args, **kwargs):
+        return {
+            "message": "An error occurred while adding documents.",
+            "error": "SSL SYSCALL error: EOF detected",
+            "code": "VECTOR_DB_TRANSIENT_ERROR",
+            "retryable": True,
+            "source": "vector_db",
+            "attempts": 3,
+        }
+
+    monkeypatch.setattr(document_routes, "store_data_in_vector_db", mocked_store_error)
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed-upload",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"uploaded_file": ("upload_store_error.txt", f, "text/plain")},
+            headers=auth_headers,
+        )
+    assert response.status_code == 503, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["code"] == "VECTOR_DB_TRANSIENT_ERROR"
+    assert json_data["retryable"] is True
+    assert json_data["source"] == "vector_db"
+
+
+@pytest.mark.asyncio
+async def test_store_data_in_vector_db_retries_transient_db_error(monkeypatch):
+    from app.routes import document_routes
+    from app.services.vector_store.async_pg_vector import AsyncPgVector
+
+    call_count = {"value": 0}
+
+    async def flaky_aadd_documents(self, docs, ids=None, executor=None):
+        call_count["value"] += 1
+        if call_count["value"] < 3:
+            raise RuntimeError("SSL SYSCALL error: EOF detected")
+        return ids
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "langchain")
+    monkeypatch.setattr(document_routes, "EMBEDDING_BATCH_SIZE", 0)
+    monkeypatch.setattr(document_routes, "VECTOR_DB_RETRY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(document_routes, "VECTOR_DB_RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(document_routes, "VECTOR_DB_RETRY_MAX_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(document_routes, "VECTOR_DB_RETRY_JITTER_SECONDS", 0.0)
+    monkeypatch.setattr(AsyncPgVector, "aadd_documents", flaky_aadd_documents)
+
+    docs = [Document(page_content="retry test content", metadata={})]
+    result = await document_routes.store_data_in_vector_db(
+        data=docs,
+        file_id="retry-test-id",
+        user_id="testuser",
+        executor=app.state.thread_pool,
+    )
+
+    assert result["message"] == "Documents added successfully"
+    assert call_count["value"] == 3
+
+
 def test_embed_file_poma_job_failed_returns_upstream_status(
     tmp_path, auth_headers, monkeypatch
 ):

@@ -1,11 +1,12 @@
 # app/routes/document_routes.py
 import os
 import hashlib
+import random
 import traceback
 import aiofiles
 import aiofiles.os
 from shutil import copyfileobj
-from typing import List, Iterable, TYPE_CHECKING
+from typing import Any, List, Iterable, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import (
     APIRouter,
@@ -72,6 +73,37 @@ from app.services.poma_bridge import (
 
 router = APIRouter()
 
+VECTOR_DB_RETRY_MAX_ATTEMPTS = max(
+    1,
+    int(os.getenv("VECTOR_DB_RETRY_MAX_ATTEMPTS", "3")),
+)
+VECTOR_DB_RETRY_BASE_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("VECTOR_DB_RETRY_BASE_DELAY_SECONDS", "1.0")),
+)
+VECTOR_DB_RETRY_MAX_DELAY_SECONDS = max(
+    VECTOR_DB_RETRY_BASE_DELAY_SECONDS,
+    float(os.getenv("VECTOR_DB_RETRY_MAX_DELAY_SECONDS", "8.0")),
+)
+VECTOR_DB_RETRY_JITTER_SECONDS = max(
+    0.0,
+    float(os.getenv("VECTOR_DB_RETRY_JITTER_SECONDS", "0.25")),
+)
+
+TRANSIENT_VECTOR_DB_ERROR_MARKERS = (
+    "ssl syscall error: eof detected",
+    "server closed the connection unexpectedly",
+    "terminating connection due to administrator command",
+    "connection reset by peer",
+    "connection refused",
+    "could not connect to server",
+    "connection not open",
+    "broken pipe",
+    "timeout expired",
+    "connection timed out",
+    "too many connections",
+)
+
 
 def calculate_num_batches(total: int, batch_size: int) -> int:
     """Calculate the number of batches needed to process total items."""
@@ -97,6 +129,64 @@ def _safe_file_size(path: str) -> int | None:
         return os.path.getsize(path)
     except OSError:
         return None
+
+
+def _iter_exception_chain(error: BaseException) -> Iterable[BaseException]:
+    current: BaseException | None = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_transient_vector_db_error(error: Exception) -> bool:
+    for current in _iter_exception_chain(error):
+        message = str(current).lower()
+        class_name = current.__class__.__name__.lower()
+        if any(marker in message for marker in TRANSIENT_VECTOR_DB_ERROR_MARKERS):
+            return True
+        if class_name in {"operationalerror", "interfaceerror"} and "timeout" in message:
+            return True
+    return False
+
+
+def _compute_vector_db_retry_delay_seconds(failed_attempt: int) -> float:
+    exp_delay = VECTOR_DB_RETRY_BASE_DELAY_SECONDS * (2 ** max(0, failed_attempt - 1))
+    capped_delay = min(exp_delay, VECTOR_DB_RETRY_MAX_DELAY_SECONDS)
+    if VECTOR_DB_RETRY_JITTER_SECONDS <= 0:
+        return capped_delay
+    return capped_delay + random.uniform(0, VECTOR_DB_RETRY_JITTER_SECONDS)
+
+
+def _coerce_store_error_response(result: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    detail = result.get("error") or result.get("detail") or result.get("message")
+    if not detail:
+        detail = "Failed to process/store the file data."
+
+    retryable = bool(result.get("retryable"))
+    payload: dict[str, Any] = {
+        "code": result.get("code")
+        or ("VECTOR_DB_TRANSIENT_ERROR" if retryable else "VECTOR_DB_ERROR"),
+        "detail": str(detail),
+        "message": str(result.get("message") or detail),
+        "retryable": retryable,
+        "source": result.get("source") or "vector_db",
+    }
+
+    if isinstance(result.get("attempts"), int):
+        payload["attempts"] = result["attempts"]
+
+    for key in ("upstream_status", "upstream_code", "upstream_detail"):
+        if result.get(key) is not None:
+            payload[key] = result[key]
+
+    status_code = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if retryable
+        else status.HTTP_500_INTERNAL_SERVER_ERROR
+    )
+    return status_code, payload
 
 
 async def save_upload_file_async(file: UploadFile, temp_file_path: str) -> None:
@@ -737,7 +827,7 @@ async def store_data_in_vector_db(
     source_filename: str | None = None,
     poma_trace_id: str | None = None,
     poma_route: str | None = None,
-) -> bool:
+) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
 
     if CHUNKER_PROVIDER == "poma":
@@ -831,61 +921,90 @@ async def store_data_in_vector_db(
             clean_content,
         )
 
-    try:
-        if CHUNKER_PROVIDER == "poma":
-            logger.info(
-                "POMA pipeline vector insert start | trace=%s | route=%s | file_id=%s | docs=%d | embedding_batch_size=%s | vector_store=%s",
-                poma_trace_id,
-                poma_route,
-                file_id,
-                len(docs),
-                EMBEDDING_BATCH_SIZE,
-                type(vector_store).__name__,
-            )
-        if EMBEDDING_BATCH_SIZE <= 0:
-            # synchronously embed the file and insert into vector store in one go
-            if isinstance(vector_store, AsyncPgVector):
-                ids = await vector_store.aadd_documents(
-                    docs, ids=[file_id] * len(docs), executor=executor
-                )
-            else:
-                ids = vector_store.add_documents(docs, ids=[file_id] * len(docs))
-        else:
-            # asynchronously embed the file and insert into vector store as it is embedding
-            # to lessen memory impact and speed up slightly as the majority of the document
-            # is inserted into db by the time it is fully embedded
-
-            if isinstance(vector_store, AsyncPgVector):
-                ids = await _process_documents_async_pipeline(
-                    docs, file_id, vector_store, executor
-                )
-            else:
-                # Fallback to batched processing for sync vector stores
-                ids = await _process_documents_batched_sync(
-                    docs, file_id, vector_store, executor
-                )
-
-        if CHUNKER_PROVIDER == "poma":
-            logger.info(
-                "POMA pipeline vector insert complete | trace=%s | route=%s | file_id=%s | inserted_ids=%d",
-                poma_trace_id,
-                poma_route,
-                file_id,
-                len(ids) if isinstance(ids, list) else 0,
-            )
-        return {"message": "Documents added successfully", "ids": ids}
-
-    except Exception as e:
-        logger.error(
-            "Failed to store data in vector DB | File ID: %s | User ID: %s | POMA trace: %s | POMA route: %s | Error: %s | Traceback: %s",
-            file_id,
-            user_id,
+    if CHUNKER_PROVIDER == "poma":
+        logger.info(
+            "POMA pipeline vector insert start | trace=%s | route=%s | file_id=%s | docs=%d | embedding_batch_size=%s | vector_store=%s",
             poma_trace_id,
             poma_route,
-            str(e),
-            traceback.format_exc(),
+            file_id,
+            len(docs),
+            EMBEDDING_BATCH_SIZE,
+            type(vector_store).__name__,
         )
-        return {"message": "An error occurred while adding documents.", "error": str(e)}
+
+    max_attempts = max(1, VECTOR_DB_RETRY_MAX_ATTEMPTS)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if EMBEDDING_BATCH_SIZE <= 0:
+                # Synchronously embed the file and insert into vector store in one go.
+                if isinstance(vector_store, AsyncPgVector):
+                    ids = await vector_store.aadd_documents(
+                        docs, ids=[file_id] * len(docs), executor=executor
+                    )
+                else:
+                    ids = vector_store.add_documents(docs, ids=[file_id] * len(docs))
+            else:
+                # Asynchronously embed the file and insert into vector store as it is embedding
+                # to lessen memory impact and speed up slightly as the majority of the document
+                # is inserted into db by the time it is fully embedded.
+                if isinstance(vector_store, AsyncPgVector):
+                    ids = await _process_documents_async_pipeline(
+                        docs, file_id, vector_store, executor
+                    )
+                else:
+                    # Fallback to batched processing for sync vector stores.
+                    ids = await _process_documents_batched_sync(
+                        docs, file_id, vector_store, executor
+                    )
+
+            if CHUNKER_PROVIDER == "poma":
+                logger.info(
+                    "POMA pipeline vector insert complete | trace=%s | route=%s | file_id=%s | inserted_ids=%d | attempts=%d",
+                    poma_trace_id,
+                    poma_route,
+                    file_id,
+                    len(ids) if isinstance(ids, list) else 0,
+                    attempt,
+                )
+            return {"message": "Documents added successfully", "ids": ids}
+
+        except Exception as e:
+            retryable = _is_transient_vector_db_error(e)
+            should_retry = retryable and attempt < max_attempts
+
+            logger.error(
+                "Failed to store data in vector DB | File ID: %s | User ID: %s | POMA trace: %s | POMA route: %s | Attempt: %d/%d | Retryable: %s | Error: %s | Traceback: %s",
+                file_id,
+                user_id,
+                poma_trace_id,
+                poma_route,
+                attempt,
+                max_attempts,
+                retryable,
+                str(e),
+                traceback.format_exc(),
+            )
+
+            if should_retry:
+                delay_seconds = _compute_vector_db_retry_delay_seconds(attempt)
+                logger.warning(
+                    "Retrying vector DB insert after transient failure | File ID: %s | Attempt: %d/%d | Delay: %.2fs",
+                    file_id,
+                    attempt,
+                    max_attempts,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+
+            return {
+                "message": "An error occurred while adding documents.",
+                "error": str(e),
+                "code": "VECTOR_DB_TRANSIENT_ERROR" if retryable else "VECTOR_DB_ERROR",
+                "retryable": retryable,
+                "source": "vector_db",
+                "attempts": attempt,
+            }
 
 
 @router.post("/local/embed")
@@ -957,25 +1076,36 @@ async def embed_local_file(
                 isinstance(result, dict) and "error" in result,
             )
 
-        if result:
-            if CHUNKER_PROVIDER == "poma":
-                logger.info(
-                    "POMA route request success | route=/local/embed | trace=%s | file_id=%s | filename=%s",
-                    poma_trace_id,
-                    document.file_id,
-                    document.filename,
-                )
-            return {
-                "status": True,
-                "file_id": document.file_id,
-                "filename": document.filename,
-                "known_type": known_type,
-            }
-        else:
+        if not result:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=ERROR_MESSAGES.DEFAULT(),
             )
+
+        if isinstance(result, dict) and "error" in result:
+            error_status_code, error_payload = _coerce_store_error_response(result)
+            logger.warning(
+                "store_data_in_vector_db returned error | route=/local/embed | trace=%s | file_id=%s | code=%s | retryable=%s",
+                poma_trace_id,
+                document.file_id,
+                error_payload.get("code"),
+                error_payload.get("retryable"),
+            )
+            return JSONResponse(status_code=error_status_code, content=error_payload)
+
+        if CHUNKER_PROVIDER == "poma":
+            logger.info(
+                "POMA route request success | route=/local/embed | trace=%s | file_id=%s | filename=%s",
+                poma_trace_id,
+                document.file_id,
+                document.filename,
+            )
+        return {
+            "status": True,
+            "file_id": document.file_id,
+            "filename": document.filename,
+            "known_type": known_type,
+        }
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_local_file | POMA trace: %s | Status: %d | Detail: %s",
@@ -1088,16 +1218,19 @@ async def embed_file(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
-        elif "error" in result:
+
+        if isinstance(result, dict) and "error" in result:
             response_status = False
-            response_message = "Failed to process/store the file data."
-            if isinstance(result["error"], str):
-                response_message = result["error"]
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="An unspecified error occurred.",
-                )
+            error_status_code, error_payload = _coerce_store_error_response(result)
+            response_message = error_payload["message"]
+            logger.warning(
+                "store_data_in_vector_db returned error | route=/embed | trace=%s | file_id=%s | code=%s | retryable=%s",
+                poma_trace_id,
+                file_id,
+                error_payload.get("code"),
+                error_payload.get("retryable"),
+            )
+            return JSONResponse(status_code=error_status_code, content=error_payload)
     except HTTPException as http_exc:
         response_status = False
         response_message = f"HTTP Exception: {http_exc.detail}"
@@ -1353,6 +1486,17 @@ async def embed_file_upload(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to process/store the file data.",
             )
+
+        if isinstance(result, dict) and "error" in result:
+            error_status_code, error_payload = _coerce_store_error_response(result)
+            logger.warning(
+                "store_data_in_vector_db returned error | route=/embed-upload | trace=%s | file_id=%s | code=%s | retryable=%s",
+                poma_trace_id,
+                file_id,
+                error_payload.get("code"),
+                error_payload.get("retryable"),
+            )
+            return JSONResponse(status_code=error_status_code, content=error_payload)
     except HTTPException as http_exc:
         logger.error(
             "HTTP Exception in embed_file_upload | POMA trace: %s | Status: %d | Detail: %s",
