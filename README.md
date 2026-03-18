@@ -89,8 +89,14 @@ The following environment variables are required to run the application:
 - `COLLECTION_NAME`: (Optional) The name of the collection in the vector store. Default value is "testcollection".
 - `CHUNK_SIZE`: (Optional) The size of the chunks for text processing. Default value is "1500".
 - `CHUNK_OVERLAP`: (Optional) The overlap between chunks during text processing. Default value is "100".
-- `EMBEDDING_BATCH_SIZE`: (Optional) Number of document chunks to process per batch. Set to `0` (default) to disable batching. Recommended value is `750` for `text-embedding-3-small`.
+- `EMBEDDING_BATCH_SIZE`: (Optional) Number of document chunks to process per batch. Set to `0` to disable batching. Recommended value is `750` for `text-embedding-3-small`.
+  - Default is `250` when `CHUNKER_PROVIDER=poma` and `EMBEDDING_BATCH_SIZE` is unset.
+  - Default is `0` for non-POMA chunking when unset.
+- `POMA_INGEST_METHOD`: (Optional) PrimeCut ingestion mode to use when `CHUNKER_PROVIDER=poma`. Valid values are `ingest` and `ingest_eco`. Defaults to `ingest`.
+- `POMA_ACCEPTED_EXTENSIONS`: (Optional) Comma-separated allowlist of file extensions accepted by the RAG upload endpoints (`/embed`, `/embed-upload`). Extensions may be written with or without a leading dot, for example `pdf,txt,md,docx`. When unset, the API falls back to its built-in set of supported document, code, and text extensions.
 - `EMBEDDING_MAX_QUEUE_SIZE`: (Optional) Maximum number of batches to buffer in memory during async processing. Default value is "3".
+- `RAG_INGEST_THREAD_POOL_SIZE`: (Optional) Worker count for file loading, chunking, and insert operations. Defaults to the legacy `RAG_THREAD_POOL_SIZE` behavior, capped at `8`.
+- `RAG_QUERY_THREAD_POOL_SIZE`: (Optional) Worker count reserved for query embedding and similarity search. Defaults to `2`.
 - `RAG_UPLOAD_DIR`: (Optional) The directory where uploaded files are stored. Default value is "./uploads/".
 - `PDF_EXTRACT_IMAGES`: (Optional) A boolean value indicating whether to extract images from PDF files. Default value is "False".
 - `DEBUG_RAG_API`: (Optional) Set to "True" to show more verbose logging output in the server console, and to enable postgresql database routes
@@ -145,8 +151,11 @@ For large files, you can enable batched embedding processing to reduce memory co
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EMBEDDING_BATCH_SIZE` | `0` | Number of document chunks to process per batch. `0` disables batching (original behavior). |
+| `EMBEDDING_BATCH_SIZE` | `250` in `poma`, else `0` | Number of document chunks to process per batch. `0` disables batching. |
+| `POMA_INGEST_METHOD` | `ingest` | PrimeCut ingestion mode. `ingest_eco` uses the SDK's eco upload path. |
 | `EMBEDDING_MAX_QUEUE_SIZE` | `3` | Maximum number of batches to buffer in memory during async processing. |
+| `RAG_INGEST_THREAD_POOL_SIZE` | capped CPU count | Worker count for ingestion-side executor tasks. |
+| `RAG_QUERY_THREAD_POOL_SIZE` | `2` | Worker count reserved for query-side executor tasks. |
 
 #### Recommended Settings
 
@@ -168,7 +177,7 @@ When `EMBEDDING_BATCH_SIZE > 0`:
 - On failure, successfully inserted documents are rolled back
 - Memory usage is bounded by `EMBEDDING_BATCH_SIZE * EMBEDDING_MAX_QUEUE_SIZE`
 
-When `EMBEDDING_BATCH_SIZE = 0` (default):
+When `EMBEDDING_BATCH_SIZE = 0`:
 - All documents are processed at once (original behavior)
 - Better for small files or memory-rich environments
 

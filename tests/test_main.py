@@ -41,10 +41,21 @@ def override_vector_store(monkeypatch):
     )
 
     # Initialize thread pool for tests since TestClient doesn't run lifespan
-    if not hasattr(app.state, "thread_pool") or app.state.thread_pool is None:
-        app.state.thread_pool = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="test-worker"
+    if (
+        not hasattr(app.state, "thread_pool")
+        or app.state.thread_pool is None
+        or not hasattr(app.state, "ingest_thread_pool")
+        or app.state.ingest_thread_pool is None
+        or not hasattr(app.state, "query_thread_pool")
+        or app.state.query_thread_pool is None
+    ):
+        app.state.ingest_thread_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="test-ingest"
         )
+        app.state.query_thread_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="test-query"
+        )
+        app.state.thread_pool = app.state.ingest_thread_pool
 
     # Override get_all_ids as an async function - patch at CLASS level to bypass run_in_executor
     async def dummy_get_all_ids(self, executor=None):
@@ -248,6 +259,103 @@ def test_embed_file(tmp_path, auth_headers):
     assert json_data["message"] == "File processed successfully."
     assert json_data["file_id"] == "testid1"
     assert json_data["filename"] == "test_embed.txt"
+
+
+def test_embed_file_rejects_unaccepted_extension_before_saving(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    save_called = {"value": False}
+
+    async def fail_if_save_called(file, temp_file_path):
+        save_called["value"] = True
+        raise AssertionError("save_upload_file_async should not be called")
+
+    monkeypatch.setattr(document_routes, "POMA_ACCEPTED_EXTENSIONS", ("txt",))
+    monkeypatch.setattr(
+        document_routes, "POMA_ACCEPTED_EXTENSIONS_SET", frozenset({"txt"})
+    )
+    monkeypatch.setattr(document_routes, "save_upload_file_async", fail_if_save_called)
+
+    test_file = tmp_path / "test_embed.exe"
+    test_file.write_text("not allowed")
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"file": ("test_embed.exe", f, "application/octet-stream")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 400, f"Response: {response.text}"
+    assert "Unsupported file extension '.exe'" in response.json()["detail"]
+    assert "Allowed extensions: .txt" in response.json()["detail"]
+    assert save_called["value"] is False
+
+
+def test_embed_file_normalizes_background_rag_upload_metadata(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    captured = {}
+
+    async def fake_store_data_in_vector_db(
+        *,
+        data,
+        file_id,
+        user_id="",
+        clean_content=False,
+        executor=None,
+        source_file_path=None,
+        source_filename=None,
+        poma_ingest_method=None,
+        poma_trace_id=None,
+        poma_route=None,
+    ):
+        captured["data"] = data
+        captured["file_id"] = file_id
+        captured["user_id"] = user_id
+        captured["clean_content"] = clean_content
+        captured["source_file_path"] = source_file_path
+        captured["source_filename"] = source_filename
+        captured["poma_ingest_method"] = poma_ingest_method
+        captured["poma_route"] = poma_route
+        return {"status": True}
+
+    monkeypatch.setattr(document_routes, "CHUNKER_PROVIDER", "poma")
+    monkeypatch.setattr(
+        document_routes, "store_data_in_vector_db", fake_store_data_in_vector_db
+    )
+
+    file_content = "This is a background RAG upload."
+    test_file = tmp_path / "test_embed.txt"
+    test_file.write_text(file_content)
+    background_filename = "test_embed.txt.rag-b7914e97-378d-44de-b5a0-29bd87760693"
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed",
+            data={
+                "file_id": "testid1",
+                "entity_id": "testuser",
+                "poma_ingest_method": "ingest_eco",
+            },
+            files={"file": (background_filename, f, "application/octet-stream")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 200, f"Response: {response.text}"
+    json_data = response.json()
+    assert json_data["filename"] == "test_embed.txt"
+    assert captured["source_filename"] == "test_embed.txt"
+    assert captured["source_file_path"].endswith("testid1__test_embed.txt")
+    assert captured["poma_ingest_method"] == "ingest_eco"
+    assert captured["poma_route"] == "/embed"
+    assert captured["data"] == []
+    assert captured["clean_content"] is False
 
 
 def test_embed_file_too_many_jobs_returns_structured_403(
@@ -560,6 +668,40 @@ def test_embed_file_upload(tmp_path, auth_headers, monkeypatch):
     json_data = response.json()
     assert json_data["status"] is True
     assert json_data["file_id"] == "testid1"
+
+
+def test_embed_file_upload_rejects_unaccepted_extension_before_saving(
+    tmp_path, auth_headers, monkeypatch
+):
+    from app.routes import document_routes
+
+    save_called = {"value": False}
+
+    async def fail_if_save_called(file, temp_file_path):
+        save_called["value"] = True
+        raise AssertionError("save_upload_file_async should not be called")
+
+    monkeypatch.setattr(document_routes, "POMA_ACCEPTED_EXTENSIONS", ("txt",))
+    monkeypatch.setattr(
+        document_routes, "POMA_ACCEPTED_EXTENSIONS_SET", frozenset({"txt"})
+    )
+    monkeypatch.setattr(document_routes, "save_upload_file_async", fail_if_save_called)
+
+    test_file = tmp_path / "upload_test.exe"
+    test_file.write_text("not allowed")
+
+    with test_file.open("rb") as f:
+        response = client.post(
+            "/embed-upload",
+            data={"file_id": "testid1", "entity_id": "testuser"},
+            files={"uploaded_file": ("upload_test.exe", f, "application/octet-stream")},
+            headers=auth_headers,
+        )
+
+    assert response.status_code == 400, f"Response: {response.text}"
+    assert "Unsupported file extension '.exe'" in response.json()["detail"]
+    assert "Allowed extensions: .txt" in response.json()["detail"]
+    assert save_called["value"] is False
 
 
 def test_query_multiple(auth_headers):

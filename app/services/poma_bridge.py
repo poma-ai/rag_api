@@ -1,6 +1,5 @@
 import json
 import os
-import time
 import traceback
 from typing import Any, Iterable
 
@@ -11,6 +10,7 @@ from app.config import (
     POMA_STORE_DIR,
     POMA_TIMEOUT_SECONDS,
     POMA_POLL_INTERVAL_SECONDS,
+    POMA_INGEST_METHOD,
 )
 
 
@@ -334,10 +334,10 @@ def _get_poma_client():
     """
 
     try:
-        from poma import Poma  # type: ignore
+        from poma import PrimeCut  # type: ignore
     except Exception:
         try:
-            from poma.client import Poma  # type: ignore
+            from poma.client import PrimeCut  # type: ignore
         except Exception as e:
             raise RuntimeError(
                 "POMA chunking requested but 'poma' package is not installed. "
@@ -350,9 +350,12 @@ def _get_poma_client():
 
     # Support both positional and keyword constructors.
     try:
-        return Poma(api_key=api_key)
+        return PrimeCut(api_key=api_key, timeout=POMA_TIMEOUT_SECONDS)
     except TypeError:
-        return Poma(api_key)
+        try:
+            return PrimeCut(api_key=api_key)
+        except TypeError:
+            return PrimeCut(api_key)
 
 
 # def _extract_job_id(start_resp: Any) -> str:
@@ -364,192 +367,100 @@ def _get_poma_client():
 #     raise RuntimeError(f"Could not determine POMA job id from response: {start_resp}")
 
 
-def poma_chunk_file(file_path: str) -> dict[str, Any]:
-    """Run POMA structural chunking on a file path and return {chunks, chunksets}."""
+def _normalize_poma_ingest_method(ingest_method: str | None) -> str:
+    value = (ingest_method or POMA_INGEST_METHOD).strip().lower()
+    if value not in {"ingest", "ingest_eco"}:
+        raise ValueError(
+            f"Unsupported POMA ingest method '{value}'. Expected 'ingest' or 'ingest_eco'."
+        )
+    return value
+
+
+def _coerce_poma_result_to_dict(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        payload = to_dict()
+        if isinstance(payload, dict):
+            images = getattr(result, "images", None)
+            if isinstance(images, dict):
+                payload["images"] = images
+            return payload
+
+    raise RuntimeError(
+        f"Unsupported POMA result type '{type(result).__name__}'; expected dict-like payload or PomaResult."
+    )
+
+
+def poma_chunk_file(
+    file_path: str, *, ingest_method: str | None = None
+) -> dict[str, Any]:
+    """Run PrimeCut chunking on a file path and return dictified PomaResult data."""
 
     client = _get_poma_client()
     file_name = os.path.basename(file_path)
-    poll_count = 0
+    resolved_ingest_method = _normalize_poma_ingest_method(ingest_method)
+    ingest_fn = getattr(client, resolved_ingest_method, None)
+    if not callable(ingest_fn):
+        raise RuntimeError(
+            f"POMA SDK client does not expose callable method '{resolved_ingest_method}'."
+        )
 
     logger.info(
-        "POMA chunking start | file=%s | file_path=%s",
+        "POMA chunking start | file=%s | file_path=%s | ingest_method=%s",
         file_name,
         file_path,
+        resolved_ingest_method,
     )
 
     try:
-        start_resp = client.start_chunk_file(file_path)
+        result = ingest_fn(
+            file_path,
+            initial_delay=0.0,
+            poll_interval=POMA_POLL_INTERVAL_SECONDS,
+            max_interval=max(POMA_POLL_INTERVAL_SECONDS, 15.0),
+            show_progress=False,
+        )
     except Exception as e:
         _raise_if_poma_too_many_jobs_error(e)
         _raise_if_poma_retryable_create_job_error(e)
+        _raise_if_poma_terminal_job_failure_error(e)
         status_code, body = _get_http_response_from_exception(e)
         logger.error(
-            "POMA start_chunk_file exception | file=%s | error=%s",
+            "POMA PrimeCut exception | file=%s | ingest_method=%s | error=%s",
             file_name,
+            resolved_ingest_method,
             str(e),
         )
         logger.error(
-            "POMA start_chunk_file error response (full) | file=%s | status_code=%s | body=%s",
+            "POMA PrimeCut error response (full) | file=%s | ingest_method=%s | status_code=%s | body=%s",
             file_name,
+            resolved_ingest_method,
             status_code,
             body or "(no body)",
         )
-        raise RuntimeError(f"POMA start_chunk_file failed: {e}") from e
-    _raise_if_poma_too_many_jobs_response(start_resp)
-    _raise_if_poma_retryable_create_job_response(start_resp)
-
-    if isinstance(start_resp, dict):
-        logger.info(
-            "POMA chunking job created | file=%s | job_id=%s | status=%s | response_keys=%s",
-            file_name,
-            start_resp.get("job_id"),
-            start_resp.get("status"),
-            sorted(start_resp.keys()),
-        )
-    else:
-        logger.info(
-            "POMA chunking start response (non-dict) | file=%s | type=%s | response=%s",
-            file_name,
-            type(start_resp).__name__,
-            start_resp,
-        )
-
-    job_id = start_resp.get("job_id") #_extract_job_id(start_resp)
-    if not job_id:
-        raise RuntimeError(f"Could not determine POMA job id from response: {start_resp}")
-    t0 = time.time()
-    last_err: Exception | None = None
-
-    while time.time() - t0 <= POMA_TIMEOUT_SECONDS:
-        try:
-            res = client.get_chunk_result(job_id)
-            poll_count += 1
-            _raise_if_poma_too_many_jobs_response(res)
-            _raise_if_poma_terminal_job_failure_response(res)
-
-            # Common patterns: {"status": "processing"} while running.
-            if isinstance(res, dict):
-                status = str(res.get("status", "")).lower()
-                has_chunks = "chunks" in res
-                has_chunksets = "chunksets" in res
-                nested = res.get("result") or res.get("data")
-                nested_keys = (
-                    sorted(nested.keys()) if isinstance(nested, dict) else None
-                )
-                logger.info(
-                    "POMA poll | file=%s | job_id=%s | attempt=%d | status=%s | has_chunks=%s | has_chunksets=%s | response_keys=%s | nested_keys=%s",
-                    file_name,
-                    job_id,
-                    poll_count,
-                    status or "<missing>",
-                    has_chunks,
-                    has_chunksets,
-                    sorted(res.keys()),
-                    nested_keys,
-                )
-                if status in {"processing", "queued", "running", "pending"}:
-                    time.sleep(POMA_POLL_INTERVAL_SECONDS)
-                    continue
-
-                if has_chunks and has_chunksets:
-                    logger.info(
-                        "POMA chunking complete (direct payload) | file=%s | job_id=%s | attempts=%d | chunks=%s | chunksets=%s",
-                        file_name,
-                        job_id,
-                        poll_count,
-                        len(res.get("chunks", [])) if isinstance(res.get("chunks"), list) else "n/a",
-                        len(res.get("chunksets", [])) if isinstance(res.get("chunksets"), list) else "n/a",
-                    )
-                    return res
-
-                # Sometimes the SDK may return the payload nested.
-                if isinstance(nested, dict) and "chunks" in nested and "chunksets" in nested:
-                    logger.info(
-                        "POMA chunking complete (nested payload) | file=%s | job_id=%s | attempts=%d | nested_chunks=%s | nested_chunksets=%s",
-                        file_name,
-                        job_id,
-                        poll_count,
-                        len(nested.get("chunks", [])) if isinstance(nested.get("chunks"), list) else "n/a",
-                        len(nested.get("chunksets", [])) if isinstance(nested.get("chunksets"), list) else "n/a",
-                    )
-                    return nested
-
-                if status in {"completed", "complete", "success", "succeeded", "done"}:
-                    logger.warning(
-                        "POMA reported terminal success status but payload missing chunks/chunksets; continuing to poll | file=%s | job_id=%s | attempt=%d | status=%s | response_keys=%s",
-                        file_name,
-                        job_id,
-                        poll_count,
-                        status,
-                        sorted(res.keys()),
-                    )
-            else:
-                logger.info(
-                    "POMA poll (non-dict response) | file=%s | job_id=%s | attempt=%d | type=%s | response=%s",
-                    file_name,
-                    job_id,
-                    poll_count,
-                    type(res).__name__,
-                    res,
-                )
-
-            # If we get here: keep polling.
-            time.sleep(POMA_POLL_INTERVAL_SECONDS)
-        except Exception as e:
-            _raise_if_poma_too_many_jobs_error(e)
-            _raise_if_poma_terminal_job_failure_error(e)
-            status_code, body = _get_http_response_from_exception(e)
-            logger.warning(
-                "POMA poll exception; will retry until timeout | file=%s | job_id=%s | attempt=%d | error=%s",
-                file_name,
-                job_id,
-                poll_count,
-                str(e),
-            )
-            if body or status_code is not None:
-                logger.warning(
-                    "POMA poll error response (full) | file=%s | job_id=%s | attempt=%d | status_code=%s | body=%s",
-                    file_name,
-                    job_id,
-                    poll_count,
-                    status_code,
-                    body or "(no body)",
-                )
-            last_err = e
-            time.sleep(POMA_POLL_INTERVAL_SECONDS)
-
-    if last_err is not None:
-        status_code, body = _get_http_response_from_exception(last_err)
-        logger.error(
-            "POMA chunking timeout with last error | file=%s | job_id=%s | attempts=%d | timeout_seconds=%s | last_error=%s",
-            file_name,
-            job_id,
-            poll_count,
-            POMA_TIMEOUT_SECONDS,
-            str(last_err),
-        )
-        if body or status_code is not None:
-            logger.error(
-                "POMA chunking timeout last error response (full) | file=%s | job_id=%s | status_code=%s | body=%s",
-                file_name,
-                job_id,
-                status_code,
-                body or "(no body)",
-            )
         raise RuntimeError(
-            f"Timed out waiting for POMA chunking result after {POMA_TIMEOUT_SECONDS}s. "
-            f"Last error: {last_err}"
-        )
-    logger.error(
-        "POMA chunking timeout without explicit last error | file=%s | job_id=%s | attempts=%d | timeout_seconds=%s",
+            f"PrimeCut.{resolved_ingest_method} failed: {e}"
+        ) from e
+
+    result_dict = _coerce_poma_result_to_dict(result)
+    logger.info(
+        "POMA chunking complete | file=%s | ingest_method=%s | chunks=%s | chunksets=%s | images=%s",
         file_name,
-        job_id,
-        poll_count,
-        POMA_TIMEOUT_SECONDS,
+        resolved_ingest_method,
+        len(result_dict.get("chunks", []))
+        if isinstance(result_dict.get("chunks"), list)
+        else "n/a",
+        len(result_dict.get("chunksets", []))
+        if isinstance(result_dict.get("chunksets"), list)
+        else "n/a",
+        len(result_dict.get("images", {}))
+        if isinstance(result_dict.get("images"), dict)
+        else "n/a",
     )
-    raise RuntimeError(
-        f"Timed out waiting for POMA chunking result after {POMA_TIMEOUT_SECONDS}s."
-    )
+    return result_dict
 
 
 def _store_path_for_file_id(file_id: str) -> str:

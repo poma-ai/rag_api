@@ -1,7 +1,9 @@
 # app/routes/document_routes.py
 import os
+import re
 import hashlib
 import random
+import mimetypes
 import traceback
 import aiofiles
 import aiofiles.os
@@ -41,6 +43,8 @@ from app.config import (
     EMBEDDING_MAX_QUEUE_SIZE,
     CHUNKER_PROVIDER,
     POMA_RETURN_CHEATSHEETS,
+    POMA_ACCEPTED_EXTENSIONS,
+    POMA_ACCEPTED_EXTENSIONS_SET,
     QUERY_GLOBAL,
 )
 from app.constants import ERROR_MESSAGES
@@ -104,6 +108,10 @@ TRANSIENT_VECTOR_DB_ERROR_MARKERS = (
     "too many connections",
 )
 
+BACKGROUND_RAG_FILENAME_RE = re.compile(
+    r"^(?P<base>.+?)\.rag-[0-9a-fA-F-]{8,}$"
+)
+
 
 def calculate_num_batches(total: int, batch_size: int) -> int:
     """Calculate the number of batches needed to process total items."""
@@ -112,12 +120,100 @@ def calculate_num_batches(total: int, batch_size: int) -> int:
     return (total + batch_size - 1) // batch_size
 
 
+def normalize_uploaded_filename(filename: str | None) -> str:
+    safe_filename = os.path.basename(filename or "upload")
+    match = BACKGROUND_RAG_FILENAME_RE.match(safe_filename)
+    if match:
+        normalized = match.group("base")
+        if normalized:
+            return normalized
+    return safe_filename
+
+
+def normalize_uploaded_content_type(
+    filename: str, content_type: str | None
+) -> str | None:
+    if content_type and content_type.lower() != "application/octet-stream":
+        return content_type
+
+    guessed_content_type, _ = mimetypes.guess_type(filename)
+    return guessed_content_type or content_type
+
+
+def build_temp_upload_filename(file_id: str, filename: str) -> str:
+    safe_file_id = re.sub(r"[^A-Za-z0-9_-]", "_", file_id)
+    name_root, extension = os.path.splitext(filename)
+    if not name_root:
+        name_root = "upload"
+    return f"{safe_file_id}__{name_root}{extension}"
+
+
+def get_filename_extension(filename: str | None) -> str:
+    _, extension = os.path.splitext(filename or "")
+    return extension.lower().lstrip(".")
+
+
+def get_accepted_extensions_display() -> str:
+    return ", ".join(f".{extension}" for extension in POMA_ACCEPTED_EXTENSIONS)
+
+
+def ensure_extension_is_accepted(filename: str) -> str:
+    if not POMA_ACCEPTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="RAG ingestion is disabled because no accepted upload extensions are configured.",
+        )
+
+    file_ext = get_filename_extension(filename)
+    accepted_display = get_accepted_extensions_display()
+
+    if not file_ext:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Files without an extension are not accepted for RAG ingestion. "
+                f"Allowed extensions: {accepted_display}"
+            ),
+        )
+
+    if file_ext not in POMA_ACCEPTED_EXTENSIONS_SET:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported file extension '.{file_ext}' for RAG ingestion. "
+                f"Allowed extensions: {accepted_display}"
+            ),
+        )
+
+    return file_ext
+
+
 def get_user_id(request: Request, entity_id: str = None) -> str:
     """Extract user ID from request or entity_id."""
     if not hasattr(request.state, "user"):
         return entity_id if entity_id else "public"
     else:
         return entity_id if entity_id else request.state.user.get("id")
+
+
+def get_ingest_executor(request: Request):
+    return getattr(
+        request.app.state,
+        "ingest_thread_pool",
+        getattr(request.app.state, "thread_pool", None),
+    )
+
+
+def get_query_executor(request: Request):
+    return getattr(
+        request.app.state,
+        "query_thread_pool",
+        getattr(
+            request.app.state,
+            "ingest_thread_pool",
+            getattr(request.app.state, "thread_pool", None),
+        ),
+    )
 
 
 def _new_poma_trace_id() -> str:
@@ -273,7 +369,7 @@ async def cleanup_temp_file_async(file_path: str) -> None:
 async def get_all_ids(request: Request):
     try:
         if isinstance(vector_store, AsyncPgVector):
-            ids = await vector_store.get_all_ids(executor=request.app.state.thread_pool)
+            ids = await vector_store.get_all_ids(executor=get_query_executor(request))
         else:
             ids = vector_store.get_all_ids()
 
@@ -316,10 +412,10 @@ async def get_documents_by_ids(request: Request, ids: list[str] = Query(...)):
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
+                ids, executor=get_query_executor(request)
             )
             documents = await vector_store.get_documents_by_ids(
-                ids, executor=request.app.state.thread_pool
+                ids, executor=get_query_executor(request)
             )
         else:
             existing_ids = vector_store.get_filtered_ids(ids)
@@ -358,10 +454,10 @@ async def delete_documents(request: Request, document_ids: List[str] = Body(...)
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
-                document_ids, executor=request.app.state.thread_pool
+                document_ids, executor=get_ingest_executor(request)
             )
             await vector_store.delete(
-                ids=document_ids, executor=request.app.state.thread_pool
+                ids=document_ids, executor=get_ingest_executor(request)
             )
         else:
             existing_ids = vector_store.get_filtered_ids(document_ids)
@@ -401,6 +497,10 @@ def get_cached_query_embedding(query: str):
     return vector_store.embedding_function.embed_query(query)
 
 
+async def get_query_embedding(request: Request, query: str):
+    return await run_in_executor(get_query_executor(request), get_cached_query_embedding, query)
+
+
 @router.post("/query")
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
@@ -416,14 +516,14 @@ async def query_embeddings_by_file_id(
     authorized_documents = []
 
     try:
-        embedding = get_cached_query_embedding(body.query)
+        embedding = await get_query_embedding(request, body.query)
 
         if isinstance(vector_store, AsyncPgVector):
             documents = await vector_store.asimilarity_search_with_score_by_vector(
                 embedding,
                 k=body.k,
                 filter={"file_id": body.file_id},
-                executor=request.app.state.thread_pool,
+                executor=get_query_executor(request),
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
@@ -487,7 +587,7 @@ async def query_embeddings_by_file_id(
 @router.post("/query_global")
 async def query_embeddings_global(request: Request, body: QueryGlobalBody):
     try:
-        embedding = get_cached_query_embedding(body.query)
+        embedding = await get_query_embedding(request, body.query)
 
         query_filter = None
         if not QUERY_GLOBAL:
@@ -498,7 +598,7 @@ async def query_embeddings_global(request: Request, body: QueryGlobalBody):
                 embedding,
                 k=body.k,
                 filter=query_filter,
-                executor=request.app.state.thread_pool,
+                executor=get_query_executor(request),
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
@@ -825,6 +925,7 @@ async def store_data_in_vector_db(
     executor=None,
     source_file_path: str | None = None,
     source_filename: str | None = None,
+    poma_ingest_method: str | None = None,
     poma_trace_id: str | None = None,
     poma_route: str | None = None,
 ) -> dict[str, Any]:
@@ -838,20 +939,22 @@ async def store_data_in_vector_db(
             )
 
         logger.info(
-            "POMA pipeline dispatch | trace=%s | route=%s | file_id=%s | filename=%s | user_id=%s | source_file_path=%s",
+            "POMA pipeline dispatch | trace=%s | route=%s | file_id=%s | filename=%s | user_id=%s | source_file_path=%s | ingest_method=%s",
             poma_trace_id,
             poma_route,
             file_id,
             source_filename,
             user_id,
             source_file_path,
+            poma_ingest_method,
         )
 
         # Run the (blocking) POMA chunking call in the executor.
         chunking_result = await loop.run_in_executor(
             executor,
-            poma_chunk_file,
-            source_file_path,
+            lambda: poma_chunk_file(
+                source_file_path, ingest_method=poma_ingest_method
+            ),
         )
 
         logger.info(
@@ -1051,7 +1154,7 @@ async def embed_local_file(
         if CHUNKER_PROVIDER == "poma":
             data = []
         else:
-            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            data = await run_in_executor(get_ingest_executor(request), loader.load)
             # Clean up temporary UTF-8 file if it was created for encoding conversion
             cleanup_temp_encoding_file(loader)
 
@@ -1060,7 +1163,7 @@ async def embed_local_file(
             document.file_id,
             user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=get_ingest_executor(request),
             source_file_path=document.filepath,
             source_filename=document.filename,
             poma_trace_id=poma_trace_id,
@@ -1139,6 +1242,7 @@ async def embed_file(
     file_id: str = Form(...),
     file: UploadFile = File(...),
     entity_id: str = Form(None),
+    poma_ingest_method: str = Form(None),
 ):
     response_status = True
     response_message = "File processed successfully."
@@ -1148,17 +1252,38 @@ async def embed_file(
     user_id = get_user_id(request, entity_id)
     temp_base_path = os.path.join(RAG_UPLOAD_DIR, user_id)
     os.makedirs(temp_base_path, exist_ok=True)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, user_id, file.filename)
+    resolved_filename = normalize_uploaded_filename(file.filename)
+    resolved_content_type = normalize_uploaded_content_type(
+        resolved_filename, file.content_type
+    )
+    ensure_extension_is_accepted(resolved_filename)
+    temp_file_path = os.path.join(
+        temp_base_path, build_temp_upload_filename(file_id, resolved_filename)
+    )
 
     if CHUNKER_PROVIDER == "poma":
         logger.info(
-            "POMA route request start | route=/embed | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s",
+            "POMA route request start | route=/embed | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s | ingest_method=%s",
             poma_trace_id,
             file_id,
-            file.filename,
+            resolved_filename,
             user_id,
-            file.content_type,
+            resolved_content_type,
+            poma_ingest_method,
         )
+        if (
+            resolved_filename != file.filename
+            or resolved_content_type != file.content_type
+        ):
+            logger.info(
+                "POMA route normalized upload metadata | route=/embed | trace=%s | file_id=%s | original_filename=%s | normalized_filename=%s | original_content_type=%s | normalized_content_type=%s",
+                poma_trace_id,
+                file_id,
+                file.filename,
+                resolved_filename,
+                file.content_type,
+                resolved_content_type,
+            )
 
     await save_upload_file_async(file, temp_file_path)
     if CHUNKER_PROVIDER == "poma":
@@ -1173,7 +1298,7 @@ async def embed_file(
     try:
         # Determine file type without necessarily loading/extracting content.
         loader, known_type, file_ext = get_loader(
-            file.filename, file.content_type, temp_file_path
+            resolved_filename, resolved_content_type, temp_file_path
         )
         if CHUNKER_PROVIDER == "poma":
             logger.info(
@@ -1187,7 +1312,7 @@ async def embed_file(
         if CHUNKER_PROVIDER == "poma":
             data = []
         else:
-            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            data = await run_in_executor(get_ingest_executor(request), loader.load)
             cleanup_temp_encoding_file(loader)
 
         result = await store_data_in_vector_db(
@@ -1195,9 +1320,10 @@ async def embed_file(
             file_id=file_id,
             user_id=user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=get_ingest_executor(request),
             source_file_path=temp_file_path,
-            source_filename=file.filename,
+            source_filename=resolved_filename,
+            poma_ingest_method=poma_ingest_method,
             poma_trace_id=poma_trace_id,
             poma_route="/embed",
         )
@@ -1351,13 +1477,13 @@ async def embed_file(
             "POMA route request success | route=/embed | trace=%s | file_id=%s | filename=%s",
             poma_trace_id,
             file_id,
-            file.filename,
+            resolved_filename,
         )
     return {
         "status": response_status,
         "message": response_message,
         "file_id": file_id,
-        "filename": file.filename,
+        "filename": resolved_filename,
         "known_type": known_type,
     }
 
@@ -1368,10 +1494,10 @@ async def load_document_context(request: Request, id: str):
     try:
         if isinstance(vector_store, AsyncPgVector):
             existing_ids = await vector_store.get_filtered_ids(
-                ids, executor=request.app.state.thread_pool
+                ids, executor=get_query_executor(request)
             )
             documents = await vector_store.get_documents_by_ids(
-                ids, executor=request.app.state.thread_pool
+                ids, executor=get_query_executor(request)
             )
         else:
             existing_ids = vector_store.get_filtered_ids(ids)
@@ -1416,20 +1542,42 @@ async def embed_file_upload(
     file_id: str = Form(...),
     uploaded_file: UploadFile = File(...),
     entity_id: str = Form(None),
+    poma_ingest_method: str = Form(None),
 ):
     user_id = get_user_id(request, entity_id)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, uploaded_file.filename)
+    resolved_filename = normalize_uploaded_filename(uploaded_file.filename)
+    resolved_content_type = normalize_uploaded_content_type(
+        resolved_filename, uploaded_file.content_type
+    )
+    ensure_extension_is_accepted(resolved_filename)
+    temp_file_path = os.path.join(
+        RAG_UPLOAD_DIR, build_temp_upload_filename(file_id, resolved_filename)
+    )
     poma_trace_id = _new_poma_trace_id() if CHUNKER_PROVIDER == "poma" else None
 
     if CHUNKER_PROVIDER == "poma":
         logger.info(
-            "POMA route request start | route=/embed-upload | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s",
+            "POMA route request start | route=/embed-upload | trace=%s | file_id=%s | filename=%s | user_id=%s | content_type=%s | ingest_method=%s",
             poma_trace_id,
             file_id,
-            uploaded_file.filename,
+            resolved_filename,
             user_id,
-            uploaded_file.content_type,
+            resolved_content_type,
+            poma_ingest_method,
         )
+        if (
+            resolved_filename != uploaded_file.filename
+            or resolved_content_type != uploaded_file.content_type
+        ):
+            logger.info(
+                "POMA route normalized upload metadata | route=/embed-upload | trace=%s | file_id=%s | original_filename=%s | normalized_filename=%s | original_content_type=%s | normalized_content_type=%s",
+                poma_trace_id,
+                file_id,
+                uploaded_file.filename,
+                resolved_filename,
+                uploaded_file.content_type,
+                resolved_content_type,
+            )
 
     await save_upload_file_async(uploaded_file, temp_file_path)
     if CHUNKER_PROVIDER == "poma":
@@ -1443,7 +1591,7 @@ async def embed_file_upload(
 
     try:
         loader, known_type, file_ext = get_loader(
-            uploaded_file.filename, uploaded_file.content_type, temp_file_path
+            resolved_filename, resolved_content_type, temp_file_path
         )
         if CHUNKER_PROVIDER == "poma":
             logger.info(
@@ -1457,7 +1605,7 @@ async def embed_file_upload(
         if CHUNKER_PROVIDER == "poma":
             data = []
         else:
-            data = await run_in_executor(request.app.state.thread_pool, loader.load)
+            data = await run_in_executor(get_ingest_executor(request), loader.load)
             cleanup_temp_encoding_file(loader)
 
         result = await store_data_in_vector_db(
@@ -1465,9 +1613,10 @@ async def embed_file_upload(
             file_id,
             user_id,
             clean_content=file_ext == "pdf",
-            executor=request.app.state.thread_pool,
+            executor=get_ingest_executor(request),
             source_file_path=temp_file_path,
-            source_filename=uploaded_file.filename,
+            source_filename=resolved_filename,
+            poma_ingest_method=poma_ingest_method,
             poma_trace_id=poma_trace_id,
             poma_route="/embed-upload",
         )
@@ -1532,13 +1681,13 @@ async def embed_file_upload(
             "POMA route request success | route=/embed-upload | trace=%s | file_id=%s | filename=%s",
             poma_trace_id,
             file_id,
-            uploaded_file.filename,
+            resolved_filename,
         )
     return {
         "status": True,
         "message": "File processed successfully.",
         "file_id": file_id,
-        "filename": uploaded_file.filename,
+        "filename": resolved_filename,
         "known_type": known_type,
     }
 
@@ -1547,7 +1696,7 @@ async def embed_file_upload(
 async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody):
     try:
         # Get the embedding of the query text
-        embedding = get_cached_query_embedding(body.query)
+        embedding = await get_query_embedding(request, body.query)
 
         # Perform similarity search with the query embedding and filter by the file_ids in metadata
         if isinstance(vector_store, AsyncPgVector):
@@ -1555,7 +1704,7 @@ async def query_embeddings_by_file_ids(request: Request, body: QueryMultipleBody
                 embedding,
                 k=body.k,
                 filter={"file_id": {"$in": body.file_ids}},
-                executor=request.app.state.thread_pool,
+                executor=get_query_executor(request),
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
@@ -1615,7 +1764,7 @@ async def extract_text_from_file(
             file.filename,
             file.content_type,
             temp_file_path,
-            request.app.state.thread_pool,
+            get_ingest_executor(request),
         )
 
         # Extract text content from loaded documents

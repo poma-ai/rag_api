@@ -41,6 +41,47 @@ def get_env_variable(
     return value
 
 
+def get_default_embedding_batch_size(
+    chunker_provider: str, env_value: str | None
+) -> int:
+    """Choose the effective batch size while preserving explicit env overrides."""
+    if env_value is not None:
+        return int(env_value)
+    if chunker_provider == "poma":
+        return 250
+    return 0
+
+
+def get_default_poma_ingest_method(env_value: str | None) -> str:
+    value = (env_value or "ingest").strip().lower()
+    if value not in {"ingest", "ingest_eco"}:
+        raise ValueError(
+            "POMA_INGEST_METHOD must be either 'ingest' or 'ingest_eco'"
+        )
+    return value
+
+
+def normalize_extension(extension: str) -> str:
+    return extension.strip().lower().lstrip(".")
+
+
+def parse_extension_list(
+    value: str | None, default_extensions: list[str] | tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    raw_extensions = value.split(",") if value is not None else (default_extensions or [])
+    normalized_extensions = []
+    seen = set()
+
+    for item in raw_extensions:
+        extension = normalize_extension(item)
+        if not extension or extension in seen:
+            continue
+        normalized_extensions.append(extension)
+        seen.add(extension)
+
+    return tuple(normalized_extensions)
+
+
 RAG_HOST = os.getenv("RAG_HOST", "0.0.0.0")
 RAG_PORT = int(os.getenv("RAG_PORT", 8000))
 
@@ -94,6 +135,9 @@ os.makedirs(POMA_STORE_DIR, exist_ok=True)
 # POMA chunking job polling
 POMA_TIMEOUT_SECONDS = int(get_env_variable("POMA_TIMEOUT_SECONDS", "900"))
 POMA_POLL_INTERVAL_SECONDS = float(get_env_variable("POMA_POLL_INTERVAL_SECONDS", "2"))
+POMA_INGEST_METHOD = get_default_poma_ingest_method(
+    os.getenv("POMA_INGEST_METHOD")
+)
 
 # Batch processing configuration for memory-constrained environments.
 # When EMBEDDING_BATCH_SIZE > 0, documents are processed in batches to reduce
@@ -105,7 +149,9 @@ POMA_POLL_INTERVAL_SECONDS = float(get_env_variable("POMA_POLL_INTERVAL_SECONDS"
 # - 0 = disable batching, process all at once (original behavior)
 #
 # Recommended: 750 for text-embedding-3-small (good balance of speed and memory)
-EMBEDDING_BATCH_SIZE = int(get_env_variable("EMBEDDING_BATCH_SIZE", "0"))
+EMBEDDING_BATCH_SIZE = get_default_embedding_batch_size(
+    CHUNKER_PROVIDER, os.getenv("EMBEDDING_BATCH_SIZE")
+)
 
 # Maximum number of batches to buffer in memory during async processing.
 # Higher values allow more parallelism but use more memory.
@@ -428,3 +474,31 @@ known_source_ext = [
     "jsx",
     "lhs",
 ]
+
+DEFAULT_POMA_ACCEPTED_EXTENSIONS = parse_extension_list(
+    None,
+    [
+        "txt",
+        "html",
+        "htm",
+        "tsv",
+        "pdf",
+        "csv",
+        "rst",
+        "xml",
+        "ppt",
+        "pptx",
+        "md",
+        "epub",
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "json",
+        *known_source_ext,
+    ],
+)
+POMA_ACCEPTED_EXTENSIONS = parse_extension_list(
+    os.getenv("POMA_ACCEPTED_EXTENSIONS"), DEFAULT_POMA_ACCEPTED_EXTENSIONS
+)
+POMA_ACCEPTED_EXTENSIONS_SET = frozenset(POMA_ACCEPTED_EXTENSIONS)

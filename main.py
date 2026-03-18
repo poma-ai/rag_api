@@ -27,18 +27,42 @@ from app.routes import document_routes, pgvector_routes
 from app.services.database import PSQLDatabase, ensure_vector_indexes
 
 
+def _resolve_thread_pool_size(primary_env: str, fallback: int, legacy_env: str | None = None) -> int:
+    raw_value = os.getenv(primary_env)
+    if raw_value is None and legacy_env is not None:
+        raw_value = os.getenv(legacy_env)
+
+    if raw_value is None:
+        return fallback
+
+    return max(1, int(raw_value))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic goes here
-    # Create bounded thread pool executor based on CPU cores
-    max_workers = min(
-        int(os.getenv("RAG_THREAD_POOL_SIZE", str(os.cpu_count()))), 8
-    )  # Cap at 8
-    app.state.thread_pool = ThreadPoolExecutor(
-        max_workers=max_workers, thread_name_prefix="rag-worker"
+    # Use separate pools so indexing cannot starve query handling.
+    ingest_workers = min(
+        _resolve_thread_pool_size(
+            "RAG_INGEST_THREAD_POOL_SIZE", os.cpu_count() or 1, legacy_env="RAG_THREAD_POOL_SIZE"
+        ),
+        8,
     )
+    query_workers = min(_resolve_thread_pool_size("RAG_QUERY_THREAD_POOL_SIZE", 2), 8)
+
+    app.state.ingest_thread_pool = ThreadPoolExecutor(
+        max_workers=ingest_workers, thread_name_prefix="rag-ingest"
+    )
+    app.state.query_thread_pool = ThreadPoolExecutor(
+        max_workers=query_workers, thread_name_prefix="rag-query"
+    )
+    # Backwards-compatible alias for existing code paths and tests.
+    app.state.thread_pool = app.state.ingest_thread_pool
     logger.info(
-        f"Initialized thread pool with {max_workers} workers (CPU cores: {os.cpu_count()})"
+        "Initialized thread pools | ingest_workers=%s | query_workers=%s | cpu_cores=%s",
+        ingest_workers,
+        query_workers,
+        os.cpu_count(),
     )
     if QUERY_GLOBAL:
         logger.warning(
@@ -52,8 +76,10 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup logic
-    logger.info("Shutting down thread pool")
-    app.state.thread_pool.shutdown(wait=True)
+    logger.info("Shutting down thread pools")
+    app.state.query_thread_pool.shutdown(wait=True)
+    if app.state.ingest_thread_pool is not app.state.query_thread_pool:
+        app.state.ingest_thread_pool.shutdown(wait=True)
     logger.info("Thread pool shutdown complete")
 
 

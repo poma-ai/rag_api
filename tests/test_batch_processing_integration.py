@@ -7,6 +7,8 @@ Mark with @pytest.mark.integration to skip in normal test runs.
 
 Run with: pytest tests/test_batch_processing_integration.py -v -m integration
 """
+import asyncio
+import threading
 import pytest
 import tracemalloc
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
@@ -309,3 +311,101 @@ class TestConfigurationBehavior:
                 f"batch_size={batch_size}, docs={doc_count}: "
                 f"expected {expected_batches} batches, got {actual_batches}"
             )
+
+
+class TestConcurrentQueryAccess:
+    @pytest.mark.asyncio
+    async def test_query_global_returns_partial_results_while_ingest_continues(self, monkeypatch):
+        from types import SimpleNamespace
+        from concurrent.futures import ThreadPoolExecutor
+
+        from app.models import QueryGlobalBody
+        from app.routes import document_routes
+
+        loop = asyncio.get_running_loop()
+        first_batch_inserted = asyncio.Event()
+        release_second_batch = threading.Event()
+        inserted_docs = []
+
+        ingest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-ingest")
+        query_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-query")
+
+        class MockAsyncVectorStore:
+            def __init__(self):
+                self.embedding_function = MagicMock()
+
+            async def aadd_documents(self, docs, ids=None, executor=None):
+                assert executor is ingest_executor
+
+                def blocking_insert():
+                    inserted_docs.extend(docs)
+                    if docs[0].metadata["idx"] == 0:
+                        loop.call_soon_threadsafe(first_batch_inserted.set)
+                        return ids
+
+                    release_second_batch.wait(timeout=2)
+                    return ids
+
+                return await loop.run_in_executor(executor, blocking_insert)
+
+            async def asimilarity_search_with_score_by_vector(
+                self, embedding, k=4, filter=None, executor=None
+            ):
+                assert executor is query_executor
+
+                def blocking_search():
+                    return [(doc, 0.1) for doc in inserted_docs[:k]]
+
+                return await loop.run_in_executor(executor, blocking_search)
+
+            async def delete(self, ids=None, executor=None, collection_only=False):
+                return None
+
+        store = MockAsyncVectorStore()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    ingest_thread_pool=ingest_executor,
+                    query_thread_pool=query_executor,
+                )
+            ),
+            state=SimpleNamespace(user={"id": "test-user"}),
+        )
+        docs = [
+            Document(page_content=f"doc_{i}", metadata={"idx": i, "user_id": "test-user"})
+            for i in range(10)
+        ]
+
+        monkeypatch.setattr(document_routes, "vector_store", store)
+        monkeypatch.setattr(document_routes, "AsyncPgVector", MockAsyncVectorStore)
+        monkeypatch.setattr(document_routes, "get_cached_query_embedding", lambda query: [0.1, 0.2])
+
+        try:
+            with patch("app.routes.document_routes.EMBEDDING_BATCH_SIZE", 5):
+                ingest_task = asyncio.create_task(
+                    document_routes._process_documents_async_pipeline(
+                        documents=docs,
+                        file_id="test-file",
+                        vector_store=store,
+                        executor=ingest_executor,
+                    )
+                )
+
+                await asyncio.wait_for(first_batch_inserted.wait(), timeout=1)
+
+                result = await asyncio.wait_for(
+                    document_routes.query_embeddings_global(
+                        request,
+                        QueryGlobalBody(query="partial results", entity_id="test-user", k=5),
+                    ),
+                    timeout=1,
+                )
+
+                assert len(result) == 5
+                assert result[0][0].page_content == "doc_0"
+        finally:
+            release_second_batch.set()
+            if "ingest_task" in locals():
+                await ingest_task
+            ingest_executor.shutdown(wait=True)
+            query_executor.shutdown(wait=True)

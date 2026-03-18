@@ -35,4 +35,4 @@ boto3==1.34.144
 chardet==5.2.0
 langchain-ollama==0.3.3
 tenacity>=9.0.0
-poma>=0.3.7
+poma>=0.4.2
